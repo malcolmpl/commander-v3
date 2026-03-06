@@ -1,5 +1,4 @@
 [test]
-preload = []
 timeout = 10000
 
 [install]
