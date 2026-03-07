@@ -191,11 +191,29 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
       yield "marked belt as depleted in galaxy data";
     }
 
-    // If belt depleted and we mined nothing, end cycle so Commander can reassign
-    // (avoids repeatedly traveling to the same depleted belt)
+    // If belt depleted and we mined nothing, sell/deposit any existing cargo first
+    // then end cycle so Commander can reassign cleanly
     const cargoAfterMining = ctx.ship.cargo.reduce((sum, c) => sum + c.quantity, 0);
     if (beltDepleted && cargoAfterMining <= cargoBeforeMining) {
       yield "belt empty, requesting reassignment";
+      // Sell/deposit leftover cargo so next routine starts with space
+      const hasNonFuelCargo = ctx.ship.cargo.some(
+        (c) => c.itemId !== "fuel_cell" && c.quantity > 0,
+      );
+      if (hasNonFuelCargo) {
+        try {
+          if (!ctx.player.dockedAtBase) await findAndDock(ctx);
+          if (ctx.player.dockedAtBase) {
+            const result = await disposeCargo(ctx);
+            if (result.totalEarned > 0) {
+              yield `sold leftover cargo for ${result.totalEarned}cr`;
+            } else if (result.items.length > 0) {
+              yield `deposited ${result.items.length} item(s) to storage`;
+            }
+            await refuelIfNeeded(ctx);
+          }
+        } catch { /* best effort — continue to cycle_complete */ }
+      }
       yield typedYield("cycle_complete", { type: "cycle_complete", botId: ctx.botId, routine: "miner" });
       return;
     }

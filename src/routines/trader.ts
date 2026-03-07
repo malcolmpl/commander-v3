@@ -172,6 +172,46 @@ export async function* trader(ctx: BotContext): AsyncGenerator<RoutineYield, voi
     item = ""; // Force auto-discovery of non-ore items
   }
 
+  // ── Clear leftover cargo from previous routine (e.g., ore from mining) ──
+  if (ctx.cargo.freeSpace(ctx.ship) <= 0 && ctx.ship.cargo.length > 0) {
+    // If not docked, dock first
+    if (!ctx.player.dockedAtBase) {
+      try {
+        await findAndDock(ctx);
+      } catch {
+        // Can't dock — try to continue anyway
+      }
+    }
+    if (ctx.player.dockedAtBase) {
+      yield "clearing leftover cargo from previous role";
+      for (const c of [...ctx.ship.cargo]) {
+        if (isProtectedItem(c.itemId)) continue;
+        if (c.quantity <= 0) continue;
+        // Try sell first (earns credits)
+        try {
+          const result = await ctx.api.sell(c.itemId, c.quantity);
+          await ctx.refreshState();
+          if (result.total > 0) {
+            yield `sold ${result.quantity} ${c.itemId} @ ${result.priceEach}cr = ${result.total}cr`;
+            continue;
+          }
+        } catch { /* try deposit */ }
+        // Deposit to faction storage
+        try {
+          await ctx.api.factionDepositItems(c.itemId, c.quantity);
+          await ctx.refreshState();
+          yield `deposited ${c.quantity} ${c.itemId} to faction storage`;
+        } catch { /* try personal storage */ }
+        // Personal storage fallback
+        try {
+          await ctx.api.depositItems(c.itemId, c.quantity);
+          await ctx.refreshState();
+        } catch { /* skip */ }
+      }
+      await refuelIfNeeded(ctx);
+    }
+  }
+
   // ── Faction supply chain mode (hybrid: faction sell + optional arbitrage) ──
   if (sellFromFaction) {
     yield* factionSellLoop(ctx, maxRoundTrips, blacklistedItems);
