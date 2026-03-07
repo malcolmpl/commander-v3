@@ -401,7 +401,9 @@ export class Galaxy {
         visited.add(neighbor);
         parent.set(neighbor, current);
 
-        const neighborSystem = this.graph.get(neighbor)!.system;
+        const neighborNode = this.graph.get(neighbor);
+        if (!neighborNode) continue; // Neighbor not in graph (partial map data)
+        const neighborSystem = neighborNode.system;
         if (predicate(neighborSystem)) {
           const path: string[] = [neighbor];
           let step = neighbor;

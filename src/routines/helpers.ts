@@ -504,7 +504,8 @@ export async function recoverStranded(ctx: BotContext): Promise<{ recovered: boo
   // Not stranded if docked
   if (ctx.player.dockedAtBase) return { recovered: true, method: "already_docked" };
   // Has fuel AND can actually reach a station → not stranded
-  if (ctx.ship.fuel > 0 && !ctx.fuel.isStranded(ctx.player.currentSystem, ctx.ship)) {
+  const canReachStation = (() => { try { return !ctx.fuel.isStranded(ctx.player.currentSystem, ctx.ship); } catch { return ctx.ship.fuel > 2; } })();
+  if (ctx.ship.fuel > 0 && canReachStation) {
     return { recovered: false, method: "has_fuel" };
   }
 
@@ -921,7 +922,8 @@ export async function handleFuelEmergency(ctx: BotContext): Promise<boolean> {
   }
 
   // Stranded — attempt insurance/self-destruct recovery
-  if (ctx.fuel.isStranded(ctx.player.currentSystem, ctx.ship)) {
+  const isStrandedCheck = (() => { try { return ctx.fuel.isStranded(ctx.player.currentSystem, ctx.ship); } catch { return ctx.ship.fuel <= 2; } })();
+  if (isStrandedCheck) {
     log(ctx, `stranded at ${ctx.player.currentSystem} with ${fuelPct.toFixed(0)}% fuel — attempting recovery`);
     const recovery = await recoverStranded(ctx);
     if (recovery.recovered) {
@@ -1005,7 +1007,8 @@ export async function handleEmergency(ctx: BotContext): Promise<boolean> {
   }
 
   // Last resort: if fuel is the issue and we're stranded (can't reach any station), attempt recovery
-  if (issue === "fuel_critical" && ctx.fuel.isStranded(ctx.player.currentSystem, ctx.ship)) {
+  const stranded = (() => { try { return ctx.fuel.isStranded(ctx.player.currentSystem, ctx.ship); } catch { return ctx.ship.fuel <= 2; } })();
+  if (issue === "fuel_critical" && stranded) {
     log(ctx, "attempting stranded recovery (insurance/self-destruct)");
     const recovery = await recoverStranded(ctx);
     if (recovery.recovered) {
