@@ -49,12 +49,13 @@
 	});
 
 	// Chat filter
-	let chatFilter = $state<"all" | "own" | "system" | "faction">("all");
+	let chatFilter = $state<"all" | "own" | "system" | "faction" | "local">("all");
 	const filteredChat = $derived.by(() => {
 		let msgs = $socialChat;
 		if (chatFilter === "own") msgs = msgs.filter(m => m.isOwnBot);
 		else if (chatFilter === "system") msgs = msgs.filter(m => m.channel === "system");
 		else if (chatFilter === "faction") msgs = msgs.filter(m => m.channel === "faction");
+		else if (chatFilter === "local") msgs = msgs.filter(m => m.channel === "local");
 		return msgs;
 	});
 
@@ -171,6 +172,7 @@
 							{ value: "own", label: "My Bots" },
 							{ value: "system", label: "System" },
 							{ value: "faction", label: "Faction" },
+							{ value: "local", label: "Local" },
 						] as f}
 							<button
 								class="px-2 py-1 text-[10px] rounded transition-colors {chatFilter === f.value

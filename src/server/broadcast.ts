@@ -534,7 +534,7 @@ async function pollSocialFeed(deps: BroadcastDeps): Promise<void> {
 
   // Fetch chat from multiple channels in parallel
   try {
-    const channels = ["system", "faction"] as const;
+    const channels = ["system", "faction", "local"] as const;
     const chatResults = await Promise.allSettled(
       channels.map(ch => readyBot.api!.getChatHistory(ch, 30))
     );
