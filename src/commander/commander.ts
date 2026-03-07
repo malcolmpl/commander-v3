@@ -18,6 +18,11 @@ import type { CommanderBrain, EvaluationOutput, Assignment, WorldContext, Pendin
 import { EconomyEngine } from "./economy-engine";
 import { ScoringBrain, type ScoringConfig } from "./scoring-brain";
 import { findBestUpgrade, calculateROI, scoreShipForRole, LEGACY_SHIPS } from "../core/ship-fitness";
+import { StuckDetector } from "./stuck-detector";
+import { PerformanceTracker } from "./performance-tracker";
+import { ChatIntelligence } from "./chat-intelligence";
+import type { MemoryStore } from "../data/memory-store";
+import type { StuckBot } from "../types/protocol";
 
 export interface CommanderConfig {
   /** Evaluation interval in seconds */
@@ -48,6 +53,8 @@ export interface CommanderDeps {
   defaultStorageMode?: "sell" | "deposit" | "faction_deposit";
   /** Minimum credits per bot — bots below this should return home to withdraw */
   minBotCredits?: number;
+  /** Persistent memory store (optional) */
+  memoryStore?: MemoryStore;
 }
 
 export class Commander {
@@ -65,6 +72,14 @@ export class Commander {
   private shipBlacklist = new Map<string, number>(); // classId → blacklisted until timestamp
   /** Bots that recently failed a ship upgrade — cooldown before re-queueing any upgrade */
   private botUpgradeCooldown = new Map<string, number>(); // botId → cooldown until timestamp
+  /** Stuck bot detector (inspired by CHAPERON) */
+  private stuckDetector = new StuckDetector();
+  /** Latest stuck bot list for dashboard */
+  private lastStuckBots: StuckBot[] = [];
+  /** Tracks per-bot performance outcomes for LLM feedback */
+  private performanceTracker = new PerformanceTracker();
+  /** Chat intelligence — reads and learns from global/faction chat */
+  private _chatIntelligence: ChatIntelligence | null = null;
 
   constructor(
     private config: CommanderConfig,
@@ -204,6 +219,26 @@ export class Commander {
       : null;
   }
 
+  /** Get current stuck bots */
+  getStuckBots(): StuckBot[] {
+    return this.lastStuckBots;
+  }
+
+  /** Get memory store (if configured) */
+  getMemoryStore(): MemoryStore | undefined {
+    return this.deps.memoryStore;
+  }
+
+  /** Set chat intelligence instance (shared with broadcast loop) */
+  setChatIntelligence(ci: ChatIntelligence): void {
+    this._chatIntelligence = ci;
+  }
+
+  /** Get chat intelligence (for broadcast loop sharing) */
+  getChatIntelligence(): ChatIntelligence | null {
+    return this._chatIntelligence;
+  }
+
   // ── Core Evaluation ──
 
   private async evaluateAndAssign(): Promise<CommanderDecision> {
@@ -226,26 +261,67 @@ export class Commander {
     // Step 3: Build world context from real data
     const world = this.buildWorldContext(fleet);
 
-    // Step 3.5: Pre-evaluation emergency overrides — clear cooldowns BEFORE brain runs
+    // Step 3.5: Track performance outcomes (for LLM feedback)
+    this.performanceTracker.update(fleet);
+
+    // Step 3.7: Stuck detection (inspired by CHAPERON)
+    this.lastStuckBots = this.stuckDetector.update(fleet);
+    if (this.lastStuckBots.length > 0) {
+      for (const stuck of this.lastStuckBots) {
+        this.brain.clearCooldown(stuck.botId);
+      }
+    }
+
+    // Step 3.8: Pre-evaluation emergency overrides — clear cooldowns BEFORE brain runs
     this.applyEmergencyOverrides(fleet);
 
-    // Step 4: Run brain evaluation
+    // Step 4: Run brain evaluation (inject performance + memory + chat context)
+    const performanceContext = this.performanceTracker.buildContextBlock();
+    const memoryContext = this.deps.memoryStore?.buildContextBlock() ?? "";
+    const chatContext = this._chatIntelligence?.buildContextBlock() ?? "";
+    const extraContext = [performanceContext, memoryContext, chatContext].filter(Boolean).join("\n\n");
+
     const output = await this.brain.evaluate({
       fleet,
       goals: this.goals,
       economy: economySnapshot,
       world,
       tick: this.tick,
+      extraContext: extraContext || undefined,
     });
 
     // Step 5: Build conversational thoughts
     const thoughts = this.buildThoughts(fleet, world, output);
 
-    // Step 5: Execute assignments — skip bots already running the same routine
+    // Step 5a: Enforce routine caps (prevents LLM brains from over-assigning)
+    const ROUTINE_CAPS: Partial<Record<string, number>> = {
+      scout: 1, explorer: fleet.bots.length >= 6 ? 2 : 1,
+      quartermaster: 1, hunter: 1, salvager: 1, scavenger: 1,
+      ship_upgrade: 1, refit: 2,
+    };
+    // Count bots already running each routine (that won't be reassigned)
+    const routineCounts = new Map<string, number>();
+    const assignedBotIds = new Set(output.assignments.map(a => a.botId));
+    for (const bot of fleet.bots) {
+      if (bot.routine && bot.status === "running" && !assignedBotIds.has(bot.botId)) {
+        routineCounts.set(bot.routine, (routineCounts.get(bot.routine) ?? 0) + 1);
+      }
+    }
+    // Filter assignments that would exceed caps
+    const cappedAssignments = output.assignments.filter(a => {
+      const cap = ROUTINE_CAPS[a.routine];
+      if (cap === undefined) return true; // No cap
+      const current = routineCounts.get(a.routine) ?? 0;
+      if (current >= cap) return false; // Cap exceeded, skip
+      routineCounts.set(a.routine, current + 1);
+      return true;
+    });
+
+    // Step 5b: Execute assignments — skip bots already running the same routine
     const executedAssignments: FleetAssignment[] = [];
     const botStatusMap = new Map(fleet.bots.map((b) => [b.botId, b]));
 
-    for (const assignment of output.assignments) {
+    for (const assignment of cappedAssignments) {
       // Skip re-assigning a bot that's already running this exact routine
       const botInfo = botStatusMap.get(assignment.botId);
       if (botInfo && botInfo.routine === assignment.routine && botInfo.status === "running") {
@@ -292,6 +368,9 @@ export class Commander {
 
     // Step 7: Log and record
     this.recordDecision(decision, fleet, economySnapshot);
+
+    // Step 8: Record strategic memories (persistent knowledge)
+    this.recordMemories(fleet, world, decision);
 
     return decision;
   }
@@ -375,7 +454,23 @@ export class Commander {
     // Only works with ScoringBrain (has pendingUpgrades + shipCatalog)
     if (!("pendingUpgrades" in this.brain) || !("shipCatalog" in this.brain)) return;
     const brain = this.brain as ScoringBrain;
-    if (!brain.shipCatalog || brain.shipCatalog.length === 0) return;
+
+    // Auto-load ship catalog if not yet loaded
+    if (!brain.shipCatalog || brain.shipCatalog.length === 0) {
+      const api = this.deps.getApi?.();
+      if (api) {
+        try {
+          const catalog = await this.deps.cache.getShipCatalog(api);
+          if (catalog.length > 0) {
+            brain.shipCatalog = catalog;
+            console.log(`[Commander] Ship catalog auto-loaded: ${catalog.length} ship classes`);
+          }
+        } catch (err) {
+          console.log(`[Commander] Ship catalog load failed: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+      if (!brain.shipCatalog || brain.shipCatalog.length === 0) return;
+    }
 
     const catalog = brain.shipCatalog;
     const minReserve = Math.max(5000, this.deps.minBotCredits ?? 0);
@@ -525,6 +620,7 @@ export class Commander {
         ? market.findArbitrage(allCachedStationIds, fleet.bots[0]?.systemId ?? "", medianCargo).slice(0, 10)
         : [];
       this.cachedTradeRoutes = { routes, at: now };
+      cache.marketDirty = false;
     }
     const tradeRoutes = this.cachedTradeRoutes.routes;
 
@@ -617,6 +713,12 @@ export class Commander {
       thoughts.push("Faction storage empty — miners should deposit raw materials for crafters.");
     }
 
+    // Stuck bot awareness
+    if (this.lastStuckBots.length > 0) {
+      const names = this.lastStuckBots.map((s) => s.username).join(", ");
+      thoughts.push(`Stuck bots detected: ${names}. Cooldowns cleared for immediate reassignment.`);
+    }
+
     // Bot health concerns (cooldowns already cleared in applyEmergencyOverrides before eval)
     const lowFuel = fleet.bots.filter((b) => b.fuelPct < 25 && (b.status === "running" || b.status === "ready"));
     if (lowFuel.length > 0) {
@@ -642,6 +744,34 @@ export class Commander {
       thoughts.push("All bots performing well in current roles. No changes needed.");
     }
 
+    // Chat intelligence awareness
+    if (this._chatIntelligence) {
+      const intel = this._chatIntelligence.getRecentIntel();
+      const tradeOffers = intel.filter(i => i.type === "trade_offer");
+      const warnings = intel.filter(i => i.type === "warning");
+      if (tradeOffers.length > 0) {
+        const offers = tradeOffers.slice(-3).map(t =>
+          `${t.source} ${t.direction} ${t.item}${t.price ? ` @ ${t.price}cr` : ""}`
+        ).join(", ");
+        thoughts.push(`Chat intel: ${tradeOffers.length} trade offer(s) spotted — ${offers}.`);
+      }
+      if (warnings.length > 0) {
+        thoughts.push(`Chat warning: ${warnings[warnings.length - 1].content.slice(0, 80)}`);
+      }
+    }
+
+    // Performance tracking
+    const routineStats = this.performanceTracker.getRoutineStats();
+    if (routineStats.size > 0) {
+      const topRoutines = [...routineStats.entries()]
+        .sort((a, b) => b[1].avgCreditsPerMin - a[1].avgCreditsPerMin)
+        .slice(0, 3);
+      const perf = topRoutines
+        .map(([r, s]) => `${r}: ${s.avgCreditsPerMin >= 0 ? "+" : ""}${Math.round(s.avgCreditsPerMin)}cr/min`)
+        .join(", ");
+      thoughts.push(`Routine performance: ${perf}.`);
+    }
+
     // Routine distribution
     const routineCounts = new Map<string, number>();
     for (const bot of fleet.bots) {
@@ -656,6 +786,56 @@ export class Commander {
     }
 
     return thoughts;
+  }
+
+  /** Record strategic facts into persistent memory */
+  private recordMemories(
+    fleet: FleetStatus,
+    world: WorldContext,
+    decision: CommanderDecision
+  ): void {
+    const mem = this.deps.memoryStore;
+    if (!mem) return;
+
+    try {
+      // Record fleet composition snapshot
+      const routineCounts = new Map<string, number>();
+      for (const bot of fleet.bots) {
+        if (bot.routine) routineCounts.set(bot.routine, (routineCounts.get(bot.routine) ?? 0) + 1);
+      }
+      if (routineCounts.size > 0) {
+        const dist = [...routineCounts.entries()].map(([r, c]) => `${c}x${r}`).join(", ");
+        mem.set("fleet_composition", dist, 3);
+      }
+
+      // Record best trade route profit
+      if (world.tradeRouteCount > 0) {
+        mem.set("best_trade_profit", `${world.bestTradeProfit.toFixed(1)} cr/tick across ${world.tradeRouteCount} routes`, 5);
+      }
+
+      // Record fleet size and treasury
+      mem.set("fleet_stats", `${fleet.activeBots} active bots, ${fleet.totalCredits.toLocaleString()} credits`, 4);
+
+      // Record routine performance stats
+      const perfStats = this.performanceTracker.getRoutineStats();
+      if (perfStats.size > 0) {
+        const perf = [...perfStats.entries()]
+          .sort((a, b) => b[1].avgCreditsPerMin - a[1].avgCreditsPerMin)
+          .map(([r, s]) => `${r}: ${Math.round(s.avgCreditsPerMin)}cr/min (${s.count} samples)`)
+          .join("; ");
+        mem.set("routine_performance", perf, 6);
+      }
+
+      // Record stuck bot patterns
+      if (this.lastStuckBots.length > 0) {
+        const stuckInfo = this.lastStuckBots.map((s) =>
+          `${s.username} stuck in ${s.routine ?? "unknown"} for ${Math.round(s.stuckSinceMs / 60000)}min`
+        ).join("; ");
+        mem.set("stuck_bot_report", stuckInfo, 7);
+      }
+    } catch {
+      // Memory store failure shouldn't break the Commander
+    }
   }
 
   private recordDecision(

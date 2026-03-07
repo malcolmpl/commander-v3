@@ -47,14 +47,13 @@
 
 	const navItems = [
 		{ href: "/", label: "Fleet", key: "1" },
-		{ href: "/commander", label: "Commander", key: "2" },
-		{ href: "/economy", label: "Economy", key: "3" },
-		{ href: "/faction", label: "Faction", key: "4" },
-		{ href: "/galaxy", label: "Galaxy", key: "5" },
-		{ href: "/activity", label: "Activity", key: "6" },
-		{ href: "/market", label: "Market", key: "7" },
-		{ href: "/bots", label: "Bots", key: "8" },
-		{ href: "/training", label: "Training", key: "9" },
+		{ href: "/bots", label: "Bots", key: "2" },
+		{ href: "/commander", label: "Commander", key: "3" },
+		{ href: "/social", label: "Social", key: "4" },
+		{ href: "/economy", label: "Economy", key: "5" },
+		{ href: "/faction", label: "Faction", key: "6" },
+		{ href: "/training", label: "Training", key: "7" },
+		{ href: "/manual", label: "Manual", key: "8" },
 	];
 
 	function isActive(href: string, pathname: string): boolean {

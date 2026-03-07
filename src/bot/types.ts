@@ -70,6 +70,8 @@ export interface FleetBotInfo {
   ownedShips: Array<{ id: string; classId: string }>;
   skills: Record<string, number>;
   rapidRoutines: Map<RoutineName, number>;
+  /** Average module durability (0-100). Lower = needs refit/repair. */
+  moduleWear: number;
 }
 
 export interface FleetStatus {

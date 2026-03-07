@@ -172,6 +172,11 @@ export async function* quartermaster(ctx: BotContext): AsyncGenerator<RoutineYie
 
     if (ctx.shouldStop) return;
 
+    // ── 5. Faction facility management (check & upgrade) ──
+    yield* manageFactionFacilities(ctx);
+
+    if (ctx.shouldStop) return;
+
     await refuelIfNeeded(ctx);
 
     // Moderate cycle — shorter sleep to capitalize on opportunities faster
@@ -219,10 +224,11 @@ async function* manageFactionSales(
     return;
   }
 
-  // Filter for sellable goods (not raw ores; modules only if excess above fleet targets)
+  // Filter for sellable goods (not raw ores unless 5000+; modules only if excess above fleet targets)
   const sellable: Array<{ itemId: string; quantity: number }> = [];
   for (const s of storageItems) {
-    if (s.itemId.startsWith("ore_")) continue;
+    const isOre = s.itemId.startsWith("ore_") || s.itemId.endsWith("_ore");
+    if (isOre && s.quantity < 5000) continue; // Keep ores for crafters unless overstocked
 
     if (isModuleItem(s.itemId)) {
       // Check if this module is a target type — only sell excess above target
@@ -243,7 +249,7 @@ async function* manageFactionSales(
   }
 
   if (sellable.length === 0) {
-    const oreCount = storageItems.filter((s) => s.itemId.startsWith("ore_")).length;
+    const oreCount = storageItems.filter((s) => s.itemId.startsWith("ore_") || s.itemId.endsWith("_ore")).length;
     const modCount = storageItems.filter((s) => isModuleItem(s.itemId)).length;
     yield `faction storage: ${oreCount} ore type(s), ${modCount} module type(s) — nothing to sell`;
     return;
@@ -380,9 +386,8 @@ async function* manageFactionSales(
 
     const { listPrice, cheapestElsewhere } = priceResult;
 
-    // Skip items where total revenue is too low to be worth a game tick
-    const totalRevenue = listPrice * Math.min(item.quantity, 50);
-    if (totalRevenue < 100) continue;
+    // Skip items where per-unit revenue is essentially zero
+    if (listPrice < 2) continue;
 
     // Withdraw from faction storage and sell/list
     const freeSpace = ctx.cargo.freeSpace(ctx.ship);
@@ -414,6 +419,13 @@ async function* manageFactionSales(
             }
             throw wErr2;
           }
+        } else if (wErr instanceof Error && (
+          wErr.message.includes("insufficient_storage") ||
+          wErr.message.includes("insufficient_items")
+        )) {
+          // Item was withdrawn by another bot since our snapshot — skip silently
+          yield `${itemName}: no longer in faction storage — skipped`;
+          continue;
         } else {
           throw wErr;
         }
@@ -436,6 +448,12 @@ async function* manageFactionSales(
       if (directResult.total > 0) {
         yield `sold ${directResult.quantity} ${itemName} @ ${directResult.priceEach}cr (${directResult.total}cr) — direct sell`;
         ordersCreated++;
+        // Emit trade event for logging/tracking
+        ctx.eventBus.emit({
+          type: "trade_sell", botId: ctx.botId, itemId: item.itemId, quantity: directResult.quantity,
+          priceEach: directResult.priceEach, total: directResult.total,
+          stationId: ctx.player.dockedAtBase ?? "",
+        });
 
         // Re-deposit leftover (partial fill or cargo items)
         const remaining = ctx.cargo.getItemQuantity(ctx.ship, item.itemId);
@@ -446,10 +464,35 @@ async function* manageFactionSales(
           } catch { /* best effort */ }
         }
       } else {
-        // No NPC buyer / no buy orders — create a sell order as fallback
-        // But only if the item is high-value enough to be worth listing
-        if (listPrice * sellQty >= 500) {
-          const result = await ctx.api.createSellOrder(item.itemId, sellQty, listPrice);
+        // No NPC buyer at this station — create a sell order as fallback
+        // Check if ANY station has buy orders for this item (someone wants it)
+        let hasBuyOrders = false;
+        for (const sid of cachedStationIds) {
+          const prices = ctx.cache.getMarketPrices(sid);
+          const p = prices?.find((pd) => pd.itemId === item.itemId);
+          if (p?.buyPrice && p.buyPrice > 0 && p.buyVolume > 0) { hasBuyOrders = true; break; }
+        }
+
+        // List if: buy orders exist anywhere (demand confirmed), or per-unit price is reasonable
+        const worthListing = hasBuyOrders || listPrice >= 10;
+        if (worthListing) {
+          // Re-deposit to faction storage first, then create faction sell order
+          try {
+            await ctx.api.factionDepositItems(item.itemId, sellQty);
+            await ctx.refreshState();
+          } catch { /* best effort — may already be deposited */ }
+
+          let result: Record<string, unknown>;
+          try {
+            result = await ctx.api.factionCreateSellOrder(item.itemId, listPrice, sellQty);
+          } catch {
+            // Faction orders not supported — fall back to personal sell order
+            try {
+              await ctx.api.factionWithdrawItems(item.itemId, sellQty);
+              await ctx.refreshState();
+            } catch { /* ok */ }
+            result = await ctx.api.createSellOrder(item.itemId, sellQty, listPrice) as Record<string, unknown>;
+          }
           await ctx.refreshState();
 
           // Track the sell order for future price adjustments
@@ -483,7 +526,7 @@ async function* manageFactionSales(
             await ctx.api.factionDepositItems(item.itemId, sellQty);
             await ctx.refreshState();
           } catch { /* best effort */ }
-          yield `${itemName} — no buyers, too low value to list (${listPrice * sellQty}cr)`;
+          yield `${itemName} — no demand, per-unit value too low (${listPrice}cr/ea)`;
         }
       }
 
@@ -708,7 +751,7 @@ async function* manageMaterialBuyOrders(
   for (const item of ctx.ship.cargo) {
     if (ctx.shouldStop) return;
     if (isModuleItem(item.itemId)) continue; // Handled by collectFilledOrders
-    if (item.itemId.startsWith("ore_")) continue;
+    if (item.itemId.startsWith("ore_") || item.itemId.endsWith("_ore")) continue;
     try {
       await ctx.api.factionDepositItems(item.itemId, item.quantity);
       await ctx.refreshState();
@@ -821,7 +864,14 @@ async function* manageMaterialBuyOrders(
     const orderCost = target.recommendedPrice * buyQty;
 
     try {
-      const result = await ctx.api.createBuyOrder(target.itemId, buyQty, target.recommendedPrice);
+      // Prefer faction buy orders (funded from faction treasury, better visibility)
+      let result: Record<string, unknown>;
+      try {
+        result = await ctx.api.factionCreateBuyOrder(target.itemId, target.recommendedPrice, buyQty);
+      } catch {
+        // Faction buy order not supported — fall back to personal buy order
+        result = await ctx.api.createBuyOrder(target.itemId, buyQty, target.recommendedPrice) as Record<string, unknown>;
+      }
       const orderId = String(
         (result as Record<string, unknown>).order_id ??
         (result as Record<string, unknown>).id ??
@@ -876,7 +926,7 @@ function identifyBuyOrderTargets(
 
     for (const [itemId, _qty] of rawMaterials) {
       // Skip ores (miners produce these)
-      if (itemId.startsWith("ore_")) continue;
+      if (itemId.startsWith("ore_") || itemId.endsWith("_ore")) continue;
       // Skip craftable items (crafters handle these)
       if (ctx.crafting.isCraftable(itemId)) continue;
 
@@ -987,6 +1037,81 @@ function calculateBuyPrice(
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Faction Facility Management
+// ════════════════════════════════════════════════════════════════════
+
+/**
+ * Check faction facilities at the home station and upgrade if possible.
+ * Runs once per cycle — checks for available upgrades on existing facilities,
+ * and builds essential missing facilities if the faction can afford it.
+ */
+async function* manageFactionFacilities(
+  ctx: BotContext,
+): AsyncGenerator<RoutineYield, void, void> {
+  // List faction facilities at current station
+  let facilities: Array<Record<string, unknown>> = [];
+  try {
+    facilities = await ctx.api.factionListFacilities();
+  } catch {
+    return; // No faction facilities access
+  }
+
+  if (facilities.length === 0) {
+    yield "no faction facilities at this station";
+    return;
+  }
+
+  // Check each facility for available upgrades
+  for (const fac of facilities) {
+    if (ctx.shouldStop) return;
+
+    const facId = String(fac.id ?? fac.facility_id ?? "");
+    const facName = String(fac.name ?? fac.type ?? "facility");
+    const facLevel = Number(fac.level ?? fac.tier ?? 1);
+
+    if (!facId) continue;
+
+    // Check available upgrades
+    let upgradeInfo: Record<string, unknown>;
+    try {
+      upgradeInfo = await ctx.api.facilityUpgrades(facId);
+    } catch {
+      continue; // No upgrades available or no permission
+    }
+
+    const upgrades = (upgradeInfo.upgrades ?? upgradeInfo.available ?? []) as Array<Record<string, unknown>>;
+    if (upgrades.length === 0) continue;
+
+    // Find the next tier upgrade
+    const nextUpgrade = upgrades[0];
+    const upgradeCost = Number(nextUpgrade.cost ?? nextUpgrade.credits ?? nextUpgrade.price ?? 0);
+    const upgradeType = String(nextUpgrade.type ?? nextUpgrade.facility_type ?? "");
+    const upgradeLevel = Number(nextUpgrade.level ?? nextUpgrade.tier ?? facLevel + 1);
+
+    // Check if faction treasury can afford it
+    let factionCredits = 0;
+    try {
+      factionCredits = await ctx.api.viewFactionStorageCredits();
+    } catch { /* ok */ }
+
+    // Only upgrade if faction has 2x the cost (keep reserves)
+    if (upgradeCost > 0 && factionCredits >= upgradeCost * 2) {
+      yield `upgrading ${facName} (Lv${facLevel} → Lv${upgradeLevel}) for ${upgradeCost}cr`;
+      try {
+        await ctx.api.factionFacilityUpgrade(facId, upgradeType || undefined);
+        await ctx.refreshState();
+        yield `upgraded ${facName} to level ${upgradeLevel}`;
+      } catch (err) {
+        yield `facility upgrade failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+      return; // Max one upgrade per cycle (expensive + rate limited)
+    } else if (upgradeCost > 0) {
+      yield `${facName} upgrade available (Lv${upgradeLevel}, ${upgradeCost}cr) — faction funds: ${factionCredits}cr`;
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Helpers
 // ════════════════════════════════════════════════════════════════════
 
@@ -1024,8 +1149,9 @@ export function calculateSellPrice(
     }
   }
 
-  // Skip items where market value is far below crafting cost
-  if (cheapestElsewhere < Infinity && cheapestElsewhere < costBasis * 0.5) {
+  // Skip items where market value is far below crafting cost AND no demand exists
+  // If demand exists (bestDemandPrice > 0), let market price drive the listing
+  if (cheapestElsewhere < Infinity && cheapestElsewhere < costBasis * 0.5 && bestDemandPrice <= 0) {
     return null;
   }
 

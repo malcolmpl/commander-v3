@@ -21,6 +21,7 @@ const DEFAULT_WEIGHTS: StrategyWeights = {
   quartermaster: 0.8,
   scavenger: 0.8,
   ship_upgrade: 1.0,
+  refit: 1.0,
 };
 
 /** Goal-specific weight overrides */

@@ -72,6 +72,8 @@ export interface EvaluationInput {
   economy: EconomySnapshot;
   world: WorldContext;
   tick: number;
+  /** Extra context injected by Commander (performance outcomes, persistent memory) */
+  extraContext?: string;
 }
 
 export interface EvaluationOutput {
@@ -208,6 +210,7 @@ export interface StrategyWeights {
   quartermaster: number;
   scavenger: number;
   ship_upgrade: number;
+  refit: number;
 }
 
 // ── Reassignment Tracking ──

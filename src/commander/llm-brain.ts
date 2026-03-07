@@ -20,6 +20,8 @@ export interface LlmBrainConfig {
   model: LanguageModel;
   maxTokens?: number;
   timeoutMs?: number;
+  /** Prefix prepended to user prompt (e.g. "/no_think\n" for Ollama qwen3) */
+  promptPrefix?: string;
 }
 
 /** Rolling window for latency/success tracking */
@@ -31,6 +33,8 @@ export class LlmBrain implements CommanderBrain {
   private readonly maxTokens: number;
   private readonly timeoutMs: number;
   private readonly systemPrompt: string;
+
+  private readonly promptPrefix: string;
 
   // Health tracking
   private latencies: number[] = [];
@@ -47,11 +51,12 @@ export class LlmBrain implements CommanderBrain {
     this.maxTokens = config.maxTokens ?? 1024;
     this.timeoutMs = config.timeoutMs ?? 15_000;
     this.systemPrompt = buildSystemPrompt();
+    this.promptPrefix = config.promptPrefix ?? "";
   }
 
   async evaluate(input: EvaluationInput): Promise<EvaluationOutput> {
     const startTime = Date.now();
-    const userPrompt = buildUserPrompt(input);
+    const userPrompt = buildUserPrompt(input, input.extraContext);
     const validBotIds = new Set(input.fleet.bots.map(b => b.botId));
     const now = Date.now();
 
@@ -59,12 +64,23 @@ export class LlmBrain implements CommanderBrain {
       const result = await generateText({
         model: this.model,
         system: this.systemPrompt,
-        prompt: userPrompt,
+        prompt: this.promptPrefix + userPrompt,
         maxOutputTokens: this.maxTokens,
         abortSignal: AbortSignal.timeout(this.timeoutMs),
       });
 
-      const parsed = parseLlmResponse(result.text, validBotIds);
+      // Use text if available, fall back to reasoning content (qwen3 thinking mode)
+      let responseText = result.text;
+      if (!responseText && result.reasoning) {
+        const parts = Array.isArray(result.reasoning) ? result.reasoning : [result.reasoning];
+        responseText = parts.map((p: { text?: string }) => p.text ?? String(p)).join("\n");
+      }
+
+      if (!responseText) {
+        throw new Error("Empty response from model (no text or reasoning)");
+      }
+
+      const parsed = parseLlmResponse(responseText, validBotIds);
 
       // Convert to full assignments with scores
       const assignments: Assignment[] = [];

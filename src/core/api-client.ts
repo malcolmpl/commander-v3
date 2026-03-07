@@ -47,6 +47,26 @@ export interface AnalyzeMarketResult {
   message: string;
 }
 
+export interface ChatMessage {
+  id: string;
+  channel: string;
+  playerId: string;
+  username: string;
+  content: string;
+  timestamp: string;
+}
+
+export interface ForumThread {
+  id: string;
+  title: string;
+  author: string;
+  authorId: string;
+  category: string;
+  replyCount: number;
+  createdAt: string;
+  lastReplyAt: string;
+}
+
 const BASE_URL = "https://game.spacemolt.com/api/v1";
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 1000;
@@ -710,6 +730,36 @@ export class ApiClient {
     return this.mutation("chat", { channel, content, target_id: targetId });
   }
 
+  async getChatHistory(channel: string, limit = 50): Promise<ChatMessage[]> {
+    const data = await this.query<any>("get_chat_history", { channel, limit });
+    const messages = data.messages ?? data.history ?? (Array.isArray(data) ? data : []);
+    return messages.map((m: any) => ({
+      id: String(m.id ?? m.message_id ?? ""),
+      channel: String(m.channel ?? channel),
+      playerId: String(m.player_id ?? m.playerId ?? ""),
+      username: String(m.username ?? m.player_name ?? m.name ?? ""),
+      content: String(m.content ?? m.message ?? m.text ?? ""),
+      timestamp: String(m.timestamp ?? m.created_at ?? m.sent_at ?? ""),
+    }));
+  }
+
+  async forumList(category?: string): Promise<ForumThread[]> {
+    const params: Record<string, unknown> = {};
+    if (category) params.category = category;
+    const data = await this.query<any>("forum_list", params);
+    const threads = data.threads ?? data.items ?? (Array.isArray(data) ? data : []);
+    return threads.map((t: any) => ({
+      id: String(t.id ?? t.thread_id ?? ""),
+      title: String(t.title ?? ""),
+      author: String(t.author ?? t.username ?? t.author_name ?? ""),
+      authorId: String(t.author_id ?? t.authorId ?? t.player_id ?? ""),
+      category: String(t.category ?? "general"),
+      replyCount: Number(t.reply_count ?? t.replyCount ?? t.replies ?? 0),
+      createdAt: String(t.created_at ?? t.createdAt ?? t.timestamp ?? ""),
+      lastReplyAt: String(t.last_reply_at ?? t.lastReplyAt ?? ""),
+    }));
+  }
+
   async captainsLogAdd(entry: string): Promise<Record<string, unknown>> {
     return this.query("captains_log_add", { entry });
   }
@@ -777,6 +827,343 @@ export class ApiClient {
 
   async factionWithdrawCredits(amount: number): Promise<Record<string, unknown>> {
     return this.mutation("faction_withdraw_credits", { amount });
+  }
+
+  // ── Module Repair ──
+
+  async repairModule(moduleId: string): Promise<Record<string, unknown>> {
+    return this.mutation("repair_module", { module_id: moduleId });
+  }
+
+  // ── Consumables ──
+
+  async useItem(itemId: string, quantity?: number): Promise<Record<string, unknown>> {
+    return this.mutation("use_item", { item_id: itemId, quantity: quantity ?? 1 });
+  }
+
+  // ── Missions (extended) ──
+
+  async declineMission(templateId: string): Promise<Record<string, unknown>> {
+    return this.mutation("decline_mission", { template_id: templateId });
+  }
+
+  async completedMissions(): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<any>("completed_missions");
+    return data.missions ?? data.items ?? (Array.isArray(data) ? data : []);
+  }
+
+  async viewCompletedMission(templateId: string): Promise<Record<string, unknown>> {
+    return this.query("view_completed_mission", { template_id: templateId });
+  }
+
+  // ── Action Log ──
+
+  async getActionLog(opts?: { category?: string; before?: string; limit?: number }): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<any>("get_action_log", opts ?? {});
+    return data.entries ?? data.log ?? data.actions ?? (Array.isArray(data) ? data : []);
+  }
+
+  // ── Ship Commissioning ──
+
+  async commissionQuote(shipClass: string): Promise<Record<string, unknown>> {
+    return this.query("commission_quote", { ship_class: shipClass });
+  }
+
+  async commissionShip(shipClass: string, provideMaterials?: boolean): Promise<Record<string, unknown>> {
+    return this.mutation("commission_ship", { ship_class: shipClass, provide_materials: provideMaterials });
+  }
+
+  async claimCommission(commissionId: string): Promise<Record<string, unknown>> {
+    return this.mutation("claim_commission", { commission_id: commissionId });
+  }
+
+  async supplyCommission(commissionId: string, itemId: string, quantity: number): Promise<Record<string, unknown>> {
+    return this.mutation("supply_commission", { commission_id: commissionId, item_id: itemId, quantity });
+  }
+
+  // ── Ship Marketplace ──
+
+  async buyListedShip(listingId: string): Promise<Record<string, unknown>> {
+    return this.mutation("buy_listed_ship", { listing_id: listingId });
+  }
+
+  async listShipForSale(shipId: string, price: number): Promise<Record<string, unknown>> {
+    return this.mutation("list_ship_for_sale", { ship_id: shipId, price });
+  }
+
+  async cancelShipListing(listingId: string): Promise<Record<string, unknown>> {
+    return this.mutation("cancel_ship_listing", { listing_id: listingId });
+  }
+
+  // ── Insurance ──
+
+  async getInsuranceQuote(): Promise<Record<string, unknown>> {
+    return this.query("get_insurance_quote");
+  }
+
+  async claimInsurance(): Promise<Record<string, unknown>> {
+    return this.query("claim_insurance");
+  }
+
+  // ── Player Settings ──
+
+  async setStatus(statusMessage?: string): Promise<Record<string, unknown>> {
+    return this.mutation("set_status", { status_message: statusMessage });
+  }
+
+  async setColors(primary: string, secondary: string): Promise<Record<string, unknown>> {
+    return this.mutation("set_colors", { primary_color: primary, secondary_color: secondary });
+  }
+
+  async setAnonymous(anonymous: boolean): Promise<Record<string, unknown>> {
+    return this.mutation("set_anonymous", { anonymous });
+  }
+
+  // ── Faction (extended) ──
+
+  async factionList(limit?: number, offset?: number): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<any>("faction_list", { limit, offset });
+    return data.factions ?? data.items ?? (Array.isArray(data) ? data : []);
+  }
+
+  async factionEdit(opts: { description?: string; charter?: string; primaryColor?: string; secondaryColor?: string }): Promise<Record<string, unknown>> {
+    return this.mutation("faction_edit", {
+      description: opts.description,
+      charter: opts.charter,
+      primary_color: opts.primaryColor,
+      secondary_color: opts.secondaryColor,
+    });
+  }
+
+  async factionCreateRole(name: string, priority: number, permissions?: string[]): Promise<Record<string, unknown>> {
+    return this.mutation("faction_create_role", { name, priority, permissions });
+  }
+
+  async factionEditRole(roleId: string, opts?: { name?: string; permissions?: string[] }): Promise<Record<string, unknown>> {
+    return this.mutation("faction_edit_role", { role_id: roleId, ...opts });
+  }
+
+  async factionDeleteRole(roleId: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_delete_role", { role_id: roleId });
+  }
+
+  async factionKick(playerId: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_kick", { player_id: playerId });
+  }
+
+  async leaveFaction(): Promise<Record<string, unknown>> {
+    return this.mutation("leave_faction");
+  }
+
+  async factionDeclineInvite(factionId: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_decline_invite", { faction_id: factionId });
+  }
+
+  // ── Faction Diplomacy ──
+
+  async factionDeclareWar(targetFactionId: string, reason?: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_declare_war", { target_faction_id: targetFactionId, reason });
+  }
+
+  async factionProposePeace(targetFactionId: string, terms?: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_propose_peace", { target_faction_id: targetFactionId, terms });
+  }
+
+  async factionAcceptPeace(targetFactionId: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_accept_peace", { target_faction_id: targetFactionId });
+  }
+
+  async factionSetAlly(targetFactionId: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_set_ally", { target_faction_id: targetFactionId });
+  }
+
+  async factionSetEnemy(targetFactionId: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_set_enemy", { target_faction_id: targetFactionId });
+  }
+
+  // ── Faction Missions ──
+
+  async factionPostMission(opts: {
+    title: string; description: string; type: string;
+    objectives: unknown[]; rewards: unknown[];
+    giverName?: string; giverTitle?: string; dialog?: string;
+    expirationHours?: number; triggers?: unknown[];
+  }): Promise<Record<string, unknown>> {
+    return this.mutation("faction_post_mission", {
+      title: opts.title, description: opts.description, type: opts.type,
+      objectives: opts.objectives, rewards: opts.rewards,
+      giver_name: opts.giverName, giver_title: opts.giverTitle,
+      dialog: opts.dialog, expiration_hours: opts.expirationHours,
+      triggers: opts.triggers,
+    });
+  }
+
+  async factionCancelMission(templateId: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_cancel_mission", { template_id: templateId });
+  }
+
+  async factionListMissions(): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<any>("faction_list_missions");
+    return data.missions ?? data.items ?? (Array.isArray(data) ? data : []);
+  }
+
+  // ── Faction Market Orders ──
+
+  async factionCreateBuyOrder(itemId: string, priceEach: number, quantity: number): Promise<Record<string, unknown>> {
+    return this.mutation("faction_create_buy_order", { item_id: itemId, price_each: priceEach, quantity });
+  }
+
+  async factionCreateSellOrder(itemId: string, priceEach: number, quantity: number): Promise<Record<string, unknown>> {
+    return this.mutation("faction_create_sell_order", { item_id: itemId, price_each: priceEach, quantity });
+  }
+
+  // ── Faction Intel ──
+
+  async factionQueryIntel(opts?: { systemId?: string; systemName?: string; poiType?: string; resourceType?: string }): Promise<Record<string, unknown>> {
+    return this.query("faction_query_intel", opts ?? {});
+  }
+
+  async factionQueryTradeIntel(opts?: { baseId?: string; stationName?: string; itemId?: string }): Promise<Record<string, unknown>> {
+    return this.query("faction_query_trade_intel", opts ?? {});
+  }
+
+  async factionIntelStatus(): Promise<Record<string, unknown>> {
+    return this.query("faction_intel_status");
+  }
+
+  async factionTradeIntelStatus(): Promise<Record<string, unknown>> {
+    return this.query("faction_trade_intel_status");
+  }
+
+  // ── Faction Rooms ──
+
+  async factionRooms(): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<any>("faction_rooms");
+    return data.rooms ?? data.items ?? (Array.isArray(data) ? data : []);
+  }
+
+  async factionVisitRoom(roomId: string): Promise<Record<string, unknown>> {
+    return this.query("faction_visit_room", { room_id: roomId });
+  }
+
+  async factionWriteRoom(opts: { roomId?: string; name?: string; description?: string; access?: string }): Promise<Record<string, unknown>> {
+    return this.mutation("faction_write_room", {
+      room_id: opts.roomId, name: opts.name,
+      description: opts.description, access: opts.access,
+    });
+  }
+
+  async factionDeleteRoom(roomId: string): Promise<Record<string, unknown>> {
+    return this.mutation("faction_delete_room", { room_id: roomId });
+  }
+
+  // ── Station Facilities ──
+
+  async facility(action: string, opts?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.mutation("facility", { action, ...opts });
+  }
+
+  /** List all facility types available to build */
+  async facilityTypes(opts?: { category?: string; level?: number; name?: string; page?: number }): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<any>("facility", { action: "types", ...opts });
+    return data.types ?? data.facilities ?? data.items ?? (Array.isArray(data) ? data : []);
+  }
+
+  /** List facilities at the currently docked station */
+  async facilityList(): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<any>("facility", { action: "list" });
+    return data.facilities ?? data.items ?? (Array.isArray(data) ? data : []);
+  }
+
+  /** Get available upgrades for a facility */
+  async facilityUpgrades(facilityId: string): Promise<Record<string, unknown>> {
+    return this.query("facility", { action: "upgrades", facility_id: facilityId });
+  }
+
+  /** Build a new facility at the current station */
+  async facilityBuild(facilityType: string): Promise<Record<string, unknown>> {
+    return this.mutation("facility", { action: "build", facility_type: facilityType });
+  }
+
+  /** Upgrade an existing facility */
+  async facilityUpgrade(facilityId: string, facilityType?: string): Promise<Record<string, unknown>> {
+    return this.mutation("facility", { action: "upgrade", facility_id: facilityId, facility_type: facilityType });
+  }
+
+  /** Toggle a facility on/off */
+  async facilityToggle(facilityId: string): Promise<Record<string, unknown>> {
+    return this.mutation("facility", { action: "toggle", facility_id: facilityId });
+  }
+
+  /** Build a faction facility */
+  async factionFacilityBuild(facilityType: string): Promise<Record<string, unknown>> {
+    return this.mutation("facility", { action: "faction_build", facility_type: facilityType });
+  }
+
+  /** Upgrade a faction facility */
+  async factionFacilityUpgrade(facilityId: string, facilityType?: string): Promise<Record<string, unknown>> {
+    return this.mutation("facility", { action: "faction_upgrade", facility_id: facilityId, facility_type: facilityType });
+  }
+
+  /** Transfer a facility between player and faction */
+  async facilityTransfer(facilityId: string, direction: "to_faction" | "to_player", playerId?: string): Promise<Record<string, unknown>> {
+    return this.mutation("facility", { action: "transfer", facility_id: facilityId, direction, player_id: playerId });
+  }
+
+  // ── Notes ──
+
+  async getNotes(): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<any>("get_notes");
+    return data.notes ?? data.items ?? (Array.isArray(data) ? data : []);
+  }
+
+  async createNote(title: string, content: string): Promise<Record<string, unknown>> {
+    return this.mutation("create_note", { title, content });
+  }
+
+  async readNote(noteId: string): Promise<Record<string, unknown>> {
+    return this.query("read_note", { note_id: noteId });
+  }
+
+  async writeNote(noteId: string, content: string): Promise<Record<string, unknown>> {
+    return this.mutation("write_note", { note_id: noteId, content });
+  }
+
+  // ── Forum (extended) ──
+
+  async forumGetThread(threadId: string): Promise<Record<string, unknown>> {
+    return this.query("forum_get_thread", { thread_id: threadId });
+  }
+
+  async forumReply(threadId: string, content: string): Promise<Record<string, unknown>> {
+    return this.mutation("forum_reply", { thread_id: threadId, content });
+  }
+
+  async forumCreateThread(title: string, content: string, category?: string): Promise<Record<string, unknown>> {
+    return this.mutation("forum_create_thread", { title, content, category });
+  }
+
+  async forumDeleteThread(threadId: string): Promise<Record<string, unknown>> {
+    return this.mutation("forum_delete_thread", { thread_id: threadId });
+  }
+
+  async forumDeleteReply(replyId: string): Promise<Record<string, unknown>> {
+    return this.mutation("forum_delete_reply", { reply_id: replyId });
+  }
+
+  async forumUpvote(threadId: string, replyId?: string): Promise<Record<string, unknown>> {
+    return this.mutation("forum_upvote", { thread_id: threadId, reply_id: replyId });
+  }
+
+  // ── Captain's Log (extended) ──
+
+  async captainsLogList(index?: number): Promise<Array<Record<string, unknown>>> {
+    const data = await this.query<any>("captains_log_list", index !== undefined ? { index } : {});
+    return data.entries ?? data.items ?? (Array.isArray(data) ? data : []);
+  }
+
+  async captainsLogGet(index: number): Promise<Record<string, unknown>> {
+    return this.query("captains_log_get", { index });
   }
 
   // ── Generic command for anything not wrapped above ──
@@ -893,9 +1280,12 @@ export class ApiClient {
             errMsg = String(rawErr);
           }
 
-          // Session expired - try to re-login
+          // Session expired - try to re-login (with jitter to avoid IP rate limit)
           if (errCode === "session_invalid" || errCode === "not_authenticated") {
             if (attempt < MAX_RETRIES) {
+              const jitter = Math.random() * 5000 + 2000; // 2-7s stagger
+              console.log(`[API] ${this.username} session expired, re-auth in ${(jitter / 1000).toFixed(1)}s`);
+              await sleep(jitter);
               this.sessionId = null;
               await this.createSession();
               await this.login();
@@ -1177,6 +1567,11 @@ function normalizeMission(raw: Record<string, unknown>): Mission {
     progress: num(o.progress),
     target: num(o.target ?? o.quantity ?? 1),
     complete: Boolean(o.complete ?? o.completed),
+    objectiveType: o.type ? str(o.type) : o.objective_type ? str(o.objective_type) : undefined,
+    itemId: o.item_id ? str(o.item_id) : o.itemId ? str(o.itemId) : undefined,
+    systemId: o.system_id ? str(o.system_id) : o.systemId ? str(o.systemId) : undefined,
+    poiId: o.poi_id ? str(o.poi_id) : o.poiId ? str(o.poiId) : undefined,
+    baseId: o.base_id ? str(o.base_id) : o.baseId ? str(o.baseId) : undefined,
   }));
 
   return {
@@ -1186,6 +1581,13 @@ function normalizeMission(raw: Record<string, unknown>): Mission {
     type: str(raw.type),
     objectives,
     rewards,
+    targetSystem: raw.target_system ? str(raw.target_system) : raw.targetSystem ? str(raw.targetSystem) : undefined,
+    targetPoi: raw.target_poi ? str(raw.target_poi) : raw.targetPoi ? str(raw.targetPoi) : undefined,
+    targetBase: raw.target_base ? str(raw.target_base) : raw.targetBase ? str(raw.targetBase) : undefined,
+    requiredItem: raw.required_item ? str(raw.required_item) : raw.requiredItem ? str(raw.requiredItem) : undefined,
+    requiredQuantity: raw.required_quantity ? num(raw.required_quantity) : raw.requiredQuantity ? num(raw.requiredQuantity) : undefined,
+    expiresAt: raw.expires_at ? str(raw.expires_at) : raw.expiresAt ? str(raw.expiresAt) : undefined,
+    difficulty: raw.difficulty ? str(raw.difficulty) : undefined,
   };
 }
 
@@ -1257,6 +1659,25 @@ function num(v: unknown): number {
 
 /** Normalize raw ship catalog API response → ShipClass */
 export function normalizeShipClass(raw: Record<string, unknown>): import("../types/game").ShipClass {
+  // Known keys that we explicitly map
+  const knownKeys = new Set([
+    "id", "name", "category", "description",
+    "price", "base_price", "basePrice",
+    "base_hull", "hull", "base_shield", "shield", "base_armor", "armor",
+    "base_speed", "speed", "base_fuel", "fuel",
+    "cargo_capacity", "cargoCapacity", "cpu_capacity", "cpuCapacity",
+    "power_capacity", "powerCapacity",
+    "region", "commissionable", "commission", "can_commission",
+  ]);
+
+  // Collect extra fields not explicitly mapped
+  const extra: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (!knownKeys.has(k) && v !== null && v !== undefined) {
+      extra[k] = v;
+    }
+  }
+
   return {
     id: str(raw.id),
     name: str(raw.name),
@@ -1271,5 +1692,8 @@ export function normalizeShipClass(raw: Record<string, unknown>): import("../typ
     cargoCapacity: num(raw.cargo_capacity ?? raw.cargoCapacity),
     cpuCapacity: num(raw.cpu_capacity ?? raw.cpuCapacity),
     powerCapacity: num(raw.power_capacity ?? raw.powerCapacity),
+    region: str(raw.region ?? raw.empire ?? raw.available_region ?? ""),
+    commissionable: Boolean(raw.commissionable ?? raw.commission ?? raw.can_commission ?? false),
+    ...(Object.keys(extra).length > 0 ? { extra } : {}),
   };
 }

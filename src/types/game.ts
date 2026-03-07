@@ -196,6 +196,10 @@ export interface ShipClass {
   cargoCapacity: number;
   cpuCapacity: number;
   powerCapacity: number;
+  region?: string;
+  commissionable?: boolean;
+  /** Raw extra fields from the API not explicitly mapped */
+  extra?: Record<string, unknown>;
 }
 
 export interface Skill {
@@ -263,6 +267,20 @@ export interface Mission {
   type: string;
   objectives: MissionObjective[];
   rewards: MissionReward[];
+  /** Target system ID (if mission requires travel) */
+  targetSystem?: string;
+  /** Target POI ID (if mission requires visiting a specific POI) */
+  targetPoi?: string;
+  /** Target base/station ID (for delivery missions) */
+  targetBase?: string;
+  /** Required item ID (for delivery/fetch missions) */
+  requiredItem?: string;
+  /** Required item quantity */
+  requiredQuantity?: number;
+  /** Expiry timestamp (if mission has a time limit) */
+  expiresAt?: string;
+  /** Difficulty hint from the API */
+  difficulty?: string;
 }
 
 export interface MissionObjective {
@@ -270,6 +288,16 @@ export interface MissionObjective {
   progress: number;
   target: number;
   complete: boolean;
+  /** Objective type hint (e.g. "mine", "deliver", "travel", "sell", "craft", "kill") */
+  objectiveType?: string;
+  /** Target item for this objective */
+  itemId?: string;
+  /** Target system for this objective */
+  systemId?: string;
+  /** Target POI for this objective */
+  poiId?: string;
+  /** Target base for this objective */
+  baseId?: string;
 }
 
 export interface MissionReward {

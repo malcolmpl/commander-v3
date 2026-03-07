@@ -42,6 +42,11 @@ export class Market {
     return this.cache.getMarketPrices(stationId);
   }
 
+  /** Get all station IDs that have cached market data */
+  getCachedStationIds(): string[] {
+    return this.cache.getAllMarketFreshness().map((f) => f.stationId);
+  }
+
   /**
    * Create a MarketPriceProvider that scans all cached stations for best prices.
    * Used by Crafting.estimateMarketProfit() for market-aware profit estimation.

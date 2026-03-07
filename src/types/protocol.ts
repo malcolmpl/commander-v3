@@ -3,6 +3,7 @@
  */
 
 import type { Goal, StockTarget } from "../config/schema";
+import type { ShipClass, CatalogItem, Skill, Recipe } from "./game";
 
 // ── Routine Types ──
 
@@ -19,7 +20,8 @@ export type RoutineName =
   | "scout"
   | "quartermaster"
   | "scavenger"
-  | "ship_upgrade";
+  | "ship_upgrade"
+  | "refit";
 
 export const ROUTINE_COLORS: Record<RoutineName, string> = {
   miner: "#ff6b35",
@@ -35,6 +37,7 @@ export const ROUTINE_COLORS: Record<RoutineName, string> = {
   quartermaster: "#c9a84c",
   scavenger: "#c0a060",
   ship_upgrade: "#4ecdc4",
+  refit: "#7b68ee",
 };
 
 export type BotStatus = "idle" | "logging_in" | "ready" | "running" | "stopping" | "error";
@@ -128,10 +131,13 @@ export interface OpenOrder {
   quantity: number;
   filled: number;
   priceEach: number;
+  total: number;
   stationId: string;
   stationName: string;
   createdAt: string;
   botId: string;
+  /** "personal" for bot's own orders, "faction" for faction treasury orders */
+  owner: "personal" | "faction";
 }
 
 export interface EconomyState {
@@ -297,6 +303,30 @@ export interface FactionState {
   commanderAware: boolean;
   /** Current fleet storage mode */
   storageMode: string;
+  /** Intel coverage status from faction intel submissions */
+  intelCoverage?: { systemsSubmitted: number; totalSystems: number } | null;
+  /** Trade intel coverage status from faction trade intel submissions */
+  tradeIntelCoverage?: { stationsSubmitted: number; totalStations: number } | null;
+  /** Active faction market orders (buy/sell from treasury) */
+  orders?: Array<{
+    id: string;
+    type: "buy" | "sell";
+    itemId: string;
+    itemName: string;
+    quantity: number;
+    filled: number;
+    priceEach: number;
+    stationName: string;
+  }>;
+  /** Active faction missions */
+  missions?: Array<{
+    id: string;
+    title: string;
+    description: string;
+    type: string;
+    status: string;
+    createdAt: string;
+  }>;
 }
 
 // ── Bot Storage Data (fetched on demand) ──
@@ -312,6 +342,60 @@ export interface BotStorageData {
   stations: BotStorageStation[];
   totalItems: number;
   totalCredits: number;
+}
+
+// ── Commander Memory (persistent knowledge base) ──
+
+export interface MemoryEntry {
+  key: string;
+  fact: string;
+  importance: number;
+  updatedAt: string;
+}
+
+// ── Social Feed (chat + forum) ──
+
+export interface SocialChatMessage {
+  id: string;
+  channel: string;
+  playerId: string;
+  username: string;
+  content: string;
+  timestamp: string;
+  isOwnBot: boolean;
+}
+
+export interface SocialForumThread {
+  id: string;
+  title: string;
+  author: string;
+  authorId: string;
+  category: string;
+  replyCount: number;
+  createdAt: string;
+  isOwnBot: boolean;
+}
+
+// ── Brain Decision Stats ──
+
+export interface BrainDecisionStats {
+  total: number;
+  byBrain: Array<{ brainName: string; count: number; avgLatency: number; avgConfidence: number }>;
+  recentBrainName: string | null;
+  shadowStats: {
+    totalComparisons: number;
+    avgAgreementRate: number;
+  } | null;
+}
+
+// ── Stuck Detection ──
+
+export interface StuckBot {
+  botId: string;
+  username: string;
+  routine: string | null;
+  stuckSinceMs: number;
+  lastStateChange: string;
 }
 
 // ── Server → Dashboard Messages ──
@@ -333,8 +417,10 @@ export interface GalaxySystemSummary {
     name: string;
     type: string;
     hasBase: boolean;
+    baseId: string | null;
     baseName: string | null;
     resources: Array<{ resourceId: string; richness: number; remaining: number }>;
+    scannedAt: number;
   }>;
 }
 
@@ -352,13 +438,20 @@ export type ServerMessage =
   | { type: "skill_milestone"; milestone: SkillMilestone }
   | { type: "notification"; level: "critical" | "warning" | "info"; title: string; message: string }
   | { type: "galaxy_update"; systems: GalaxySystemSummary[] }
+  | { type: "galaxy_detail"; systems: GalaxySystemSummary[]; baseMarket: Record<string, { prices: Array<{ itemId: string; itemName: string; buyPrice: number; sellPrice: number; buyVolume: number; sellVolume: number }>; freshness: { fetchedAt: number; ageMs: number; fresh: boolean } }> }
   | { type: "goals_update"; goals: Goal[] }
   | { type: "faction_update"; faction: FactionState }
   | { type: "connected"; version: string }
-  | { type: "fleet_settings_update"; settings: { factionTaxPercent: number; minBotCredits: number } }
+  | { type: "fleet_settings_update"; settings: { factionTaxPercent: number; minBotCredits: number; homeSystem?: string; homeBase?: string; defaultStorageMode?: string } }
   | { type: "bot_storage"; botId: string; storage: BotStorageData }
   | { type: "brain_health_update"; brains: BrainHealthStatus[] }
-  | { type: "supply_chain_flow"; nodes: SupplyChainNode[]; links: SupplyChainLink[] };
+  | { type: "supply_chain_flow"; nodes: SupplyChainNode[]; links: SupplyChainLink[] }
+  | { type: "memory_update"; memories: MemoryEntry[] }
+  | { type: "stuck_bots_update"; stuckBots: StuckBot[] }
+  | { type: "social_chat_update"; messages: SocialChatMessage[] }
+  | { type: "social_forum_update"; threads: SocialForumThread[] }
+  | { type: "brain_decision_stats"; stats: BrainDecisionStats }
+  | { type: "catalog_data"; ships: ShipClass[]; items: CatalogItem[]; skills: Skill[]; recipes: Recipe[] };
 
 // ── Dashboard → Server Messages ──
 
@@ -371,6 +464,7 @@ export type ClientMessage =
   | { type: "set_inventory_target"; target: StockTarget }
   | { type: "remove_inventory_target"; stationId: string; itemId: string }
   | { type: "start_bot"; botId: string }
+  | { type: "start_all_bots" }
   | { type: "stop_bot"; botId: string }
   | { type: "add_bot"; username: string; password: string }
   | { type: "remove_bot"; botId: string }
@@ -380,4 +474,7 @@ export type ClientMessage =
   | { type: "force_reassign"; botId: string; routine: RoutineName }
   | { type: "force_evaluation" }
   | { type: "refresh_cache"; cacheKey?: string }
-  | { type: "request_bot_storage"; botId: string };
+  | { type: "request_bot_storage"; botId: string }
+  | { type: "request_catalog" }
+  | { type: "request_galaxy" }
+  | { type: "request_galaxy_detail" };

@@ -19,8 +19,13 @@ import type {
   FactionState,
   BotStorageData,
   BrainHealthStatus,
+  BrainDecisionStats,
   SupplyChainNode,
   SupplyChainLink,
+  MemoryEntry,
+  StuckBot,
+  SocialChatMessage,
+  SocialForumThread,
 } from "../../../../src/types/protocol";
 import type { Goal } from "../../../../src/config/schema";
 
@@ -51,6 +56,30 @@ export const botStorage = writable<Map<string, BotStorageData>>(new Map());
 export const fleetSettings = writable<{ factionTaxPercent: number; minBotCredits: number }>({ factionTaxPercent: 0, minBotCredits: 0 });
 export const brainHealth = writable<BrainHealthStatus[]>([]);
 export const supplyChain = writable<{ nodes: SupplyChainNode[]; links: SupplyChainLink[] }>({ nodes: [], links: [] });
+export const commanderMemory = writable<MemoryEntry[]>([]);
+export const stuckBots = writable<StuckBot[]>([]);
+export const socialChat = writable<SocialChatMessage[]>([]);
+export const socialForum = writable<SocialForumThread[]>([]);
+export const brainDecisionStats = writable<BrainDecisionStats | null>(null);
+
+// Galaxy detail (enriched with market data)
+export interface GalaxyDetailData {
+  systems: GalaxySystemSummary[];
+  baseMarket: Record<string, {
+    prices: Array<{ itemId: string; itemName: string; buyPrice: number; sellPrice: number; buyVolume: number; sellVolume: number }>;
+    freshness: { fetchedAt: number; ageMs: number; fresh: boolean };
+  }>;
+}
+export const galaxyDetail = writable<GalaxyDetailData | null>(null);
+
+// Catalog data (ships, items, skills, recipes)
+export interface CatalogData {
+  ships: Array<{ id: string; name: string; category: string; description: string; basePrice: number; hull: number; shield: number; armor: number; speed: number; fuel: number; cargoCapacity: number; cpuCapacity: number; powerCapacity: number; region?: string; commissionable?: boolean; extra?: Record<string, unknown> }>;
+  items: Array<{ id: string; name: string; category: string; description: string; basePrice: number; stackSize: number }>;
+  skills: Array<{ id: string; name: string; category: string; description: string; maxLevel: number; prerequisites: Record<string, number> }>;
+  recipes: Array<{ id: string; name: string; description: string; outputItem: string; outputQuantity: number; ingredients: Array<{ itemId: string; quantity: number }>; requiredSkills: Record<string, number>; xpRewards: Record<string, number> }>;
+}
+export const catalogData = writable<CatalogData | null>(null);
 
 // Derived
 export const activeBots = derived(bots, ($bots) => $bots.filter((b) => b.status === "running"));
@@ -127,6 +156,10 @@ function handleMessage(event: MessageEvent) {
         galaxySystems.set(msg.systems);
         break;
 
+      case "galaxy_detail":
+        galaxyDetail.set({ systems: msg.systems, baseMarket: msg.baseMarket });
+        break;
+
       case "market_update":
         marketStations.set(msg.stations);
         break;
@@ -159,6 +192,30 @@ function handleMessage(event: MessageEvent) {
         supplyChain.set({ nodes: msg.nodes, links: msg.links });
         break;
 
+      case "memory_update":
+        commanderMemory.set(msg.memories);
+        break;
+
+      case "stuck_bots_update":
+        stuckBots.set(msg.stuckBots);
+        break;
+
+      case "social_chat_update":
+        socialChat.set(msg.messages);
+        break;
+
+      case "social_forum_update":
+        socialForum.set(msg.threads);
+        break;
+
+      case "brain_decision_stats":
+        brainDecisionStats.set(msg.stats);
+        break;
+
+      case "catalog_data":
+        catalogData.set(msg);
+        break;
+
       case "notification":
         notifications.update((n) => [
           {
@@ -177,6 +234,45 @@ function handleMessage(event: MessageEvent) {
   }
 }
 
+/** Fetch persisted logs and decisions from REST API on connect/reconnect */
+async function fetchHistory() {
+  try {
+    const [logsRes, decisionsRes] = await Promise.allSettled([
+      fetch("/api/logs?range=1h&limit=500"),
+      fetch("/api/decisions?range=1d&limit=100"),
+    ]);
+
+    if (logsRes.status === "fulfilled" && logsRes.value.ok) {
+      const logs: LogEntry[] = await logsRes.value.json();
+      if (logs.length > 0) {
+        activityLog.update((current) => {
+          // Merge: existing live entries + historical, dedup by timestamp+message
+          const seen = new Set(current.map((e) => `${e.timestamp}:${e.message}`));
+          const newEntries = logs.filter((e) => !seen.has(`${e.timestamp}:${e.message}`));
+          return [...current, ...newEntries]
+            .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+            .slice(0, MAX_LOG_ENTRIES);
+        });
+      }
+    }
+
+    if (decisionsRes.status === "fulfilled" && decisionsRes.value.ok) {
+      const decisions: CommanderDecision[] = await decisionsRes.value.json();
+      if (decisions.length > 0) {
+        commanderLog.update((current) => {
+          const seen = new Set(current.map((d) => d.tick));
+          const newDecisions = decisions.filter((d) => !seen.has(d.tick));
+          return [...current, ...newDecisions]
+            .sort((a, b) => b.tick - a.tick)
+            .slice(0, MAX_COMMANDER_LOG);
+        });
+      }
+    }
+  } catch {
+    // History fetch is non-critical — dashboard will populate from live events
+  }
+}
+
 export function connect() {
   if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
 
@@ -187,6 +283,9 @@ export function connect() {
     connectionState.set("connected");
     reconnectDelay = 1000;
     console.log("[WS] Connected");
+
+    // Fetch persisted history from REST API on connect
+    fetchHistory();
   };
 
   ws.onmessage = handleMessage;

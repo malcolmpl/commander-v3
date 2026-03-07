@@ -55,9 +55,11 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
           m.moduleId.includes("gas_harvester") || m.name.toLowerCase().includes("gas harvester")
         );
         const belt = system.pois.find((p) =>
-          p.type === "asteroid_belt" || p.type === "asteroid"
-          || (p.type === "ice_field" && hasIceHarvester)
-          || ((p.type === "gas_cloud" || p.type === "nebula") && hasGasHarvester)
+          !ctx.galaxy.isPoiDepleted(p.id) && (
+            p.type === "asteroid_belt" || p.type === "asteroid"
+            || (p.type === "ice_field" && hasIceHarvester)
+            || ((p.type === "gas_cloud" || p.type === "nebula") && hasGasHarvester)
+          )
         );
         if (belt) {
           targetBelt = belt.id;
@@ -77,9 +79,43 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
     }
   }
 
+  // If no belt found locally, search galaxy for nearest non-depleted belt and navigate there
   if (!targetBelt) {
-    yield "error: no asteroid belt found in current system";
-    return;
+    const allBelts = [
+      ...ctx.galaxy.findPoisByType("asteroid_belt"),
+      ...ctx.galaxy.findPoisByType("asteroid"),
+    ].filter(b => !ctx.galaxy.isPoiDepleted(b.poi.id));
+    // Sort by distance from current system
+    const botSystem = ctx.player.currentSystem;
+    if (botSystem) {
+      allBelts.sort((a, b) => {
+        const distA = ctx.galaxy.getDistance(botSystem, a.systemId);
+        const distB = ctx.galaxy.getDistance(botSystem, b.systemId);
+        const da = a.systemId === botSystem ? 0 : (distA < 0 ? 99 : distA);
+        const db = b.systemId === botSystem ? 0 : (distB < 0 ? 99 : distB);
+        return da - db;
+      });
+    }
+    const nearestBelt = allBelts[0];
+    if (nearestBelt) {
+      yield `no belt in current system — traveling to ${nearestBelt.systemId}`;
+      try {
+        await navigateToPoi(ctx, nearestBelt.poi.id);
+        targetBelt = nearestBelt.poi.id;
+        // Also find a station in the destination system
+        if (!sellStation) {
+          const destSystem = ctx.galaxy.getSystem(nearestBelt.systemId);
+          const station = destSystem?.pois.find((p) => p.baseId);
+          if (station?.baseId) sellStation = station.baseId;
+        }
+      } catch (err) {
+        yield `failed to reach belt: ${err instanceof Error ? err.message : String(err)}`;
+        return;
+      }
+    } else {
+      yield "error: no asteroid belt found anywhere in known galaxy";
+      return;
+    }
   }
 
   while (!ctx.shouldStop) {

@@ -8,14 +8,13 @@
 
 	const shortcuts = [
 		{ keys: ["1"], action: "Fleet" },
-		{ keys: ["2"], action: "Commander" },
-		{ keys: ["3"], action: "Economy" },
-		{ keys: ["4"], action: "Faction" },
-		{ keys: ["5"], action: "Galaxy" },
-		{ keys: ["6"], action: "Activity" },
+		{ keys: ["2"], action: "Bots" },
+		{ keys: ["3"], action: "Commander" },
+		{ keys: ["4"], action: "Social" },
+		{ keys: ["5"], action: "Economy" },
+		{ keys: ["6"], action: "Faction" },
 		{ keys: ["7"], action: "Market" },
-		{ keys: ["8"], action: "Bots" },
-		{ keys: ["9"], action: "Training" },
+		{ keys: ["8"], action: "Training" },
 		{ keys: ["0"], action: "Settings" },
 		{ keys: ["?"], action: "Show this overlay" },
 	];

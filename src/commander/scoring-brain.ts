@@ -26,9 +26,8 @@ import { getStrategyWeights } from "./strategies";
 
 const ALL_ROUTINES: RoutineName[] = [
   "miner", "crafter", "trader", "quartermaster", "explorer",
-  "return_home", "scout", "ship_upgrade",
-  // DISABLED — burn fuel with unreliable/zero returns:
-  // "hunter", "salvager", "scavenger", "harvester", "mission_runner",
+  "return_home", "scout", "ship_upgrade", "refit",
+  "harvester", "hunter", "salvager", "scavenger", "mission_runner",
 ];
 
 /** Routines that operate in the field and should not be interrupted for return_home */
@@ -40,10 +39,12 @@ const ROUTINE_MAX_COUNT: Partial<Record<RoutineName, number>> = {
   scout: 1,
   explorer: 1, // Default; overridden by getMaxCount() for larger fleets
   quartermaster: 1, // Only one faction home manager
+  crafter: 3,      // Allow more crafters — high-end product focus with saturation guards
   scavenger: 1,    // One scavenger roaming at a time
   hunter: 1,       // Cap combat bots — burns fuel with unreliable returns
   salvager: 1,     // One salvager at a time
   ship_upgrade: 1, // One upgrade at a time fleet-wide
+  refit: 2,        // Max 2 refitting at once — one-shot, quick
 };
 
 /** Dynamic max count: scales explorer cap with fleet size */
@@ -79,17 +80,18 @@ const DEFAULT_CONFIG: ScoringConfig = {
   baseScores: {
     miner: 70,        // TOP PRIORITY: feeds supply chain with ore → faction storage
     harvester: 45,    // Multi-target extraction (ice/gas), lower than miner
-    trader: 25,       // SELL-ONLY: sells crafted goods from faction, no arbitrage buying
+    trader: 55,       // Arbitrage trading — buys low, sells high using market data
     explorer: 40,     // Charts systems, data gathering — useful but no direct revenue
-    crafter: 65,      // HIGH PRIORITY: converts ore → goods → faction storage
+    crafter: 75,      // TOP PRIORITY: converts ore → high-end goods → faction storage
     hunter: 10,       // SUPPRESSED: burns fuel, unreliable returns
     salvager: 10,     // SUPPRESSED: burns fuel
-    mission_runner: 15, // SUPPRESSED: untested, unreliable
+    mission_runner: 50, // Reliable income: smart mission selection, skips combat, refreshes market data
     return_home: 5,     // Utility routine — only for idle bots away from home
     scout: 10,          // One-shot data gathering — scored high only when data is needed
     quartermaster: 40,  // Faction home manager — sells crafted goods, reliable revenue
     scavenger: 10,      // SUPPRESSED: burns fuel, unreliable
     ship_upgrade: 0,    // Only scores > 0 when Commander queues an upgrade
+    refit: 0,           // Only scores > 0 when bot has suboptimal modules for role
   },
   supplyMultiplier: 15,
   skillBonus: 10,
@@ -147,10 +149,13 @@ export class ScoringBrain implements CommanderBrain {
 
     // Clear cooldowns for bots stuck on over-cap routines
     // (e.g., 4 bots on scout when max is 1 — 3 need to be freed immediately)
+    // Also check lastRoutine for idle bots (between cycles, b.routine is null)
     const fleetSize = candidates.length;
     for (const routine of Object.keys(ROUTINE_MAX_COUNT) as RoutineName[]) {
       const maxCount = getMaxCount(routine, fleetSize)!;
-      const botsOnRoutine = candidates.filter((b) => b.routine === routine);
+      const botsOnRoutine = candidates.filter(
+        (b) => b.routine === routine || (!b.routine && b.lastRoutine === routine)
+      );
       if (botsOnRoutine.length > maxCount) {
         // Keep the first N, clear cooldowns on the rest so they can be reassigned
         for (let i = maxCount; i < botsOnRoutine.length; i++) {
@@ -166,6 +171,8 @@ export class ScoringBrain implements CommanderBrain {
     const activeRoutines = ALL_ROUTINES.filter((r) => {
       // ship_upgrade: skip entirely if no pending upgrades
       if (r === "ship_upgrade" && this.pendingUpgrades.size === 0) return false;
+      // refit: skip if no bots have suboptimal modules
+      if (r === "refit" && !this.anyBotNeedsRefit(candidates, economy)) return false;
       // quartermaster: needs homeBase and 3+ bots
       if (r === "quartermaster" && (!this.homeBase || fleetSize < 3)) return false;
       // scout: only useful when homeSystem is known but data is missing
@@ -211,7 +218,7 @@ export class ScoringBrain implements CommanderBrain {
       // Idle bots need an actual assignment to restart their routine
       if (!bot.routine) {
         // One-shot routines shouldn't be restarted — let them fall through to Pass 2
-        const oneShot: RoutineName[] = ["ship_upgrade", "scout", "return_home"];
+        const oneShot: RoutineName[] = ["ship_upgrade", "scout", "return_home", "refit"];
         if (oneShot.includes(routine)) {
           // Undo the lock — let Pass 2 pick a new routine
           assignedBots.delete(bot.botId);
@@ -234,6 +241,7 @@ export class ScoringBrain implements CommanderBrain {
     // Pass 0: Lock bots still on cooldown — they keep their current/last routine unconditionally.
     // Uses lastRoutine for idle bots so finishing a cycle doesn't reset the cooldown.
     // Exception: if the routine rapid-completed, don't lock — let Pass 2 find something better.
+    // Exception: if the routine is at max count, don't lock — clear cooldown for Pass 2.
     for (const bot of candidates) {
       const effectiveRoutine = (bot.routine ?? bot.lastRoutine) as RoutineName | null;
       if (!effectiveRoutine) continue;
@@ -242,6 +250,15 @@ export class ScoringBrain implements CommanderBrain {
         if (!bot.routine && bot.rapidRoutines.has(effectiveRoutine)) {
           this.clearCooldown(bot.botId); // Free them for Pass 2
           continue;
+        }
+        // Don't lock past max count — free excess bots for Pass 2
+        const maxCount = getMaxCount(effectiveRoutine, fleetSize);
+        if (maxCount !== undefined) {
+          const alreadyLocked = cycleRoutineCounts.get(effectiveRoutine) ?? 0;
+          if (alreadyLocked >= maxCount) {
+            this.clearCooldown(bot.botId);
+            continue;
+          }
         }
         lockBot(bot, effectiveRoutine);
       }
@@ -583,6 +600,12 @@ export class ScoringBrain implements CommanderBrain {
       .filter(([id]) => id.includes("ore"))
       .reduce((sum, [, qty]) => sum + qty, 0);
 
+    // Per-ore-type breakdown for surplus selling detection
+    const oreBreakdown = new Map<string, number>();
+    for (const [id, qty] of economy.factionStorage) {
+      if (id.includes("ore")) oreBreakdown.set(id, (oreBreakdown.get(id) ?? 0) + qty);
+    }
+
     switch (routine) {
       case "crafter":
         // Crafter should be strongly preferred when ANY ore is available to process
@@ -596,7 +619,8 @@ export class ScoringBrain implements CommanderBrain {
         if (oreInStorage < 3) return 25;    // Storage empty — need to mine
         if (oreInStorage < 10) return 10;   // Low ore — keep mining
         if (oreInStorage < 30) return 0;    // Neutral — enough ore for now
-        return -20; // Ore piling up — crafter should take priority, not more mining
+        if (oreInStorage < 100) return -20; // Piling up — crafter should take priority
+        return -60; // 100+ ore: strong penalty — seriously over-stocked, stop mining
       case "trader":
         // Trader gets bonus when crafted goods are in storage (ready to sell)
         {
@@ -605,6 +629,25 @@ export class ScoringBrain implements CommanderBrain {
             .reduce((sum, [, qty]) => sum + qty, 0);
           if (goodsInStorage >= 20) return 25;
           if (goodsInStorage >= 5) return 10;
+        }
+        // Trader also gets bonus when ore is massively over-stocked (5000+)
+        // At this point traders should sell raw ore to free up storage
+        {
+          let oreOverstock = 0;
+          for (const [, qty] of oreBreakdown) {
+            if (qty >= 5000) oreOverstock += qty;
+          }
+          if (oreOverstock > 0) return 40; // Sell excess ore
+        }
+        return 0;
+      case "quartermaster":
+        // QM should create sell orders for massively over-stocked ores (5000+)
+        {
+          let oreSellable = 0;
+          for (const [, qty] of oreBreakdown) {
+            if (qty >= 5000) oreSellable += qty;
+          }
+          if (oreSellable > 0) return 30;
         }
         return 0;
       default:
@@ -710,7 +753,7 @@ export class ScoringBrain implements CommanderBrain {
       case "harvester": {
         // Check if system has any extractable resource POIs
         const hasResources = system.hasBelts || system.hasIceFields || system.hasGasClouds;
-        if (!hasResources) return 50; // No resource POIs in system
+        if (!hasResources) return 200; // HARD BLOCK: no resource POIs — miner would instantly fail
         if (!system.hasStation) return 30; // Can extract but nowhere to sell/deposit
         return 0;
       }
@@ -788,8 +831,9 @@ export class ScoringBrain implements CommanderBrain {
         return hasSpecialized ? 0 : 80; // Heavy penalty if no specialized gear
       }
       case "hunter": {
-        const hasWeapon = hasModule("weapon") || hasModule("laser") || hasModule("cannon")
-          || hasModule("missile") || hasModule("turret") || hasModule("gun");
+        // Must have actual weapon modules — mining_laser, survey_scanner etc. don't count
+        const hasWeapon = hasModule("weapon_") || hasModule("cannon") || hasModule("missile")
+          || hasModule("turret") || hasModule("gun") || hasModule("blaster") || hasModule("railgun");
         return hasWeapon ? 0 : 200;
       }
       case "salvager": {
@@ -909,6 +953,13 @@ export class ScoringBrain implements CommanderBrain {
         if (pending.alreadyOwned) bonus -= 50;
         return bonus;
       }
+      case "refit": {
+        if (!bot) return 200;
+        const refitScore = this.calcRefitNeed(bot, economy);
+        if (refitScore <= 0) return 200; // No refit needed → block
+        // Higher refitScore = more urgently needs refit → lower penalty (higher effective score)
+        return -refitScore;
+      }
       default:
         return 0;
     }
@@ -986,7 +1037,7 @@ export class ScoringBrain implements CommanderBrain {
       case "salvager":
         return { salvageYard: homeBase || "", scrapMethod: "scrap" };
       case "mission_runner":
-        return { autoAccept: true, missionTypes: [], minReward: 100 };
+        return { autoAccept: true, missionTypes: [], minReward: 100, skipCombat: true, maxJumps: 4 };
       case "return_home":
         return { homeBase: this.homeBase, homeSystem: this.homeSystem };
       case "scout":
@@ -1001,6 +1052,8 @@ export class ScoringBrain implements CommanderBrain {
         return { sellMode: isFactionMode ? "faction_deposit" : "sell" };
       case "ship_upgrade":
         return this.buildShipUpgradeParams(bot);
+      case "refit":
+        return this.buildRefitParams(bot);
       default:
         return {};
     }
@@ -1017,28 +1070,70 @@ export class ScoringBrain implements CommanderBrain {
       sellOldShip: !pending.alreadyOwned, // Don't sell when switching to an already-owned ship
       alreadyOwned: pending.alreadyOwned ?? false,
       ownedShipId: pending.ownedShipId ?? "",
-      role: pending.role || bot.routine || "default",
+      role: pending.role || this.inferPrimaryRole(bot),
     };
   }
 
   /**
-   * Build trader params with order deconfliction.
+   * Build trader params with route deconfliction.
    * Assigns each trader a different trade route so they don't compete for the same orders.
+   * Uses live arbitrage data to pass specific routes + volume-aware buy limits.
    */
   private buildTraderParams(
-    _bot: FleetBotInfo,
+    bot: FleetBotInfo,
     _economy: EconomySnapshot,
-    _existingAssignments: Assignment[],
+    existingAssignments: Assignment[],
     world?: WorldContext,
   ): Record<string, unknown> {
     // Faction-sell primary, with insight-gated arbitrage when demand signals exist.
-    // Supply chain: miners → ore → faction → crafters → goods → faction → traders sell
-    // Hybrid: after faction sell, attempt 1 arbitrage trip if insights available.
     const hasInsights = (world?.demandInsightCount ?? 0) > 0;
-    return {
+
+    // Deconflict traders: each gets a different route index to avoid competing for same routes
+    const traderIndex = existingAssignments.filter(a => a.routine === "trader").length;
+
+    // Find best available route for this trader using live market data
+    const params: Record<string, unknown> = {
       sellFromFaction: true,
       enableArbitrage: hasInsights,
+      traderIndex,
     };
+
+    // If we have market data, assign a specific route with volume cap
+    if (this.market) {
+      const cachedStations = this.market.getCachedStationIds?.() ?? [];
+      if (cachedStations.length >= 2) {
+        const freeCapacity = Math.round(bot.cargoCapacity * (1 - bot.cargoPct / 100));
+        const routes = this.market.findArbitrage(
+          cachedStations, bot.systemId ?? "", freeCapacity,
+        );
+
+        // Collect volume already assigned to other traders in this evaluation
+        const assignedVolume = new Map<string, number>(); // itemId → total units assigned
+        for (const a of existingAssignments) {
+          if (a.routine === "trader" && a.params?.assignedItem) {
+            const item = String(a.params.assignedItem);
+            assignedVolume.set(item, (assignedVolume.get(item) ?? 0) + Number(a.params.maxBuyQty ?? 0));
+          }
+        }
+
+        // Pick the best route not already fully claimed by another trader
+        for (const route of routes) {
+          const alreadyClaimed = assignedVolume.get(route.itemId) ?? 0;
+          const remainingVol = (route.volume > 0 ? route.volume : 999) - alreadyClaimed;
+          if (remainingVol <= 0) continue; // Volume fully claimed by other traders
+
+          params.assignedItem = route.itemId;
+          params.assignedBuyStation = route.buyStationId;
+          params.assignedSellStation = route.sellStationId;
+          params.maxBuyQty = Math.min(remainingVol, freeCapacity);
+          params.expectedBuyPrice = route.buyPrice;
+          params.expectedSellPrice = route.sellPrice;
+          break;
+        }
+      }
+    }
+
+    return params;
   }
 
   /** Fleet home base ID (set by Commander) */
@@ -1059,6 +1154,127 @@ export class ScoringBrain implements CommanderBrain {
   pendingUpgrades = new Map<string, PendingUpgrade>();
   /** Ship catalog (set by Commander for ship fitness scoring) */
   shipCatalog: ShipClass[] = [];
+
+  // ── Refit Detection ──
+
+  /** Module patterns desired per role (matches refit.ts ROLE_MODULES) */
+  private static REFIT_ROLE_MODULES: Record<string, string[]> = {
+    miner:     ["mining_laser", "mining_laser", "mining_laser"],
+    harvester: ["ice_harvester", "gas_harvester", "mining_laser"],
+    explorer:  ["survey_scanner"],
+    hunter:    ["weapon_laser", "weapon_laser", "weapon_laser"],
+    crafter:   ["mining_laser"],
+    default:   ["mining_laser"],
+  };
+
+  /** Check if ANY bot in the fleet needs a refit (pre-filter for performance) */
+  private anyBotNeedsRefit(bots: FleetBotInfo[], economy: EconomySnapshot): boolean {
+    for (const bot of bots) {
+      if (this.calcRefitNeed(bot, economy) > 0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Calculate how urgently a bot needs a module refit (0 = no need, higher = more urgent).
+   * Checks: missing role modules, lower-tier modules when higher tiers are available.
+   */
+  private calcRefitNeed(bot: FleetBotInfo, economy: EconomySnapshot): number {
+    const role = this.inferPrimaryRole(bot);
+    const desired = ScoringBrain.REFIT_ROLE_MODULES[role];
+    if (!desired || desired.length === 0) return 0;
+
+    let score = 0;
+    const mods = bot.moduleIds;
+
+    // Count desired patterns
+    const patternCounts = new Map<string, number>();
+    for (const pattern of desired) {
+      patternCounts.set(pattern, (patternCounts.get(pattern) ?? 0) + 1);
+    }
+
+    for (const [pattern, wantCount] of patternCounts) {
+      // How many of this pattern does the bot have?
+      const installed = mods.filter(id => id.includes(pattern));
+      const haveCount = installed.length;
+
+      // Missing modules
+      if (haveCount < wantCount) {
+        // Check if faction storage has any of this pattern
+        const inStorage = [...economy.factionStorage.entries()]
+          .some(([itemId, qty]) => itemId.includes(pattern) && qty > 0);
+        if (inStorage) {
+          score += (wantCount - haveCount) * 25; // 25 per missing module with supply
+        }
+      }
+
+      // Check for tier upgrades: is a higher tier available in faction storage?
+      for (const modId of installed) {
+        const currentTier = this.extractModuleTier(modId);
+        const bestAvailableTier = this.bestAvailableTier(pattern, economy.factionStorage);
+        if (bestAvailableTier > currentTier) {
+          score += (bestAvailableTier - currentTier) * 15; // 15 per tier level improvement
+        }
+      }
+    }
+
+    // Module wear: low durability means modules need repair (refit handles this)
+    if (bot.moduleWear < 70) {
+      score += Math.round((100 - bot.moduleWear) * 0.5); // Up to 15 extra score
+    }
+
+    return score;
+  }
+
+  /** Extract tier number from module ID (e.g., mining_laser_2 -> 2) */
+  private extractModuleTier(moduleId: string): number {
+    const match = moduleId.match(/_(\d+)$/);
+    return match ? parseInt(match[1]) : 1;
+  }
+
+  /** Find the highest tier of a module pattern available in faction storage */
+  private bestAvailableTier(pattern: string, factionStorage: Map<string, number>): number {
+    let best = 0;
+    for (const [itemId, qty] of factionStorage) {
+      if (qty > 0 && itemId.includes(pattern)) {
+        const tier = this.extractModuleTier(itemId);
+        if (tier > best) best = tier;
+      }
+    }
+    return best;
+  }
+
+  /** One-shot routines that don't represent a bot's primary role */
+  private static ONE_SHOT_ROUTINES = new Set(["refit", "ship_upgrade", "scout", "return_home"]);
+
+  /** Infer the bot's primary work role (skipping one-shot routines like refit/scout) */
+  private inferPrimaryRole(bot: FleetBotInfo): string {
+    // Check current routine first
+    if (bot.routine && !ScoringBrain.ONE_SHOT_ROUTINES.has(bot.routine)) {
+      return bot.routine;
+    }
+    // Check last routine
+    if (bot.lastRoutine && !ScoringBrain.ONE_SHOT_ROUTINES.has(bot.lastRoutine)) {
+      return bot.lastRoutine;
+    }
+    // Fallback: infer from equipped modules
+    const mods = bot.moduleIds.join(" ");
+    if (mods.includes("weapon_laser")) return "hunter";
+    if (mods.includes("survey_scanner")) return "explorer";
+    if (mods.includes("ice_harvester") || mods.includes("gas_harvester")) return "harvester";
+    if (mods.includes("mining_laser")) return "miner";
+    return "default";
+  }
+
+  /** Build refit params */
+  private buildRefitParams(bot: FleetBotInfo): Record<string, unknown> {
+    const role = this.inferPrimaryRole(bot);
+    return {
+      role,
+      homeBase: this.homeBase,
+      maxSpendPct: 0.30,
+    };
+  }
 
   /**
    * Build crafter params with intelligent recipe selection:
@@ -1184,7 +1400,7 @@ export class ScoringBrain implements CommanderBrain {
       // ── Tier bonus — ONLY when materials are available ──
       // High-tier recipes score higher, but only if we can actually craft them
       if (chainDepth > 1 && canCraft) {
-        const tierBonus = Math.min(chainDepth * 20, 60); // Cap at +60
+        const tierBonus = Math.min(chainDepth * 25, 80); // Cap at +80 — strongly prefer high-tier
         score += tierBonus;
         reason += ` tier:${chainDepth}(+${tierBonus})`;
       } else if (chainDepth > 1) {
@@ -1231,18 +1447,26 @@ export class ScoringBrain implements CommanderBrain {
         }
       }
 
-      // Factor 6: Output value — higher sell price = more valuable goods
+      // Factor 6: Output value — higher sell price = more valuable goods (high-end focus)
       const outputPrice = crafting.getEffectiveSellPrice(recipe.outputItem);
       if (outputPrice > 0) {
-        score += Math.min(outputPrice / 20, 30);
+        score += Math.min(outputPrice / 15, 50); // Up to +50 for high-value products
       }
 
-      // Factor 7: Inventory saturation — aggressive overproduction prevention
-      // End products (not used in other recipes) get a tight ceiling (30 units).
+      // Factor 7: No-demand penalty — end products with no market data are likely unsellable
+      // If the item isn't an intermediate (usageCount === 0) AND profit estimation relied
+      // on MSRP (not real market data), apply a heavy penalty — nobody is buying this.
+      if (usageCount === 0 && !hasMarketData) {
+        score -= 80;
+        reason += " -NO_DEMAND(no market data, end product)";
+      }
+
+      // Factor 8: Inventory saturation — aggressive overproduction prevention
+      // End products (not used in other recipes) get a tight ceiling (15 units).
       // Intermediates (ingredients for higher-tier recipes) get a lenient ceiling (100 units).
       const outputInStorage = economy.factionStorage.get(recipe.outputItem) ?? 0;
       const isIntermediate = usageCount > 0;
-      const stockCeiling = isIntermediate ? 100 : 30;
+      const stockCeiling = isIntermediate ? 100 : 15;
 
       if (outputInStorage >= stockCeiling) {
         // Over ceiling: harsh penalty that scales with excess ratio
@@ -1258,7 +1482,7 @@ export class ScoringBrain implements CommanderBrain {
         reason += ` -inventory:${outputInStorage}/${stockCeiling}`;
       }
 
-      // Factor 8: Fleet consumable bonus — fuel cells are burned constantly by every bot
+      // Factor 9: Fleet consumable bonus — fuel cells are burned constantly by every bot
       if (recipe.outputItem === "fuel_cell" || recipe.outputItem === "fuel_cell_premium") {
         const fuelStock = economy.factionStorage.get(recipe.outputItem) ?? 0;
         const fleetSize = existingAssignments.length || 1;
@@ -1276,7 +1500,7 @@ export class ScoringBrain implements CommanderBrain {
     // Sort by score descending
     scored.sort((a, b) => b.score - a.score);
 
-    if (scored.length > 0 && scored[0].score > -999) {
+    if (scored.length > 0 && scored[0].score > 0) {  // Only assign crafter when a recipe has positive score
       const best = scored[0];
       // Calculate max batch count constrained by: materials, cargo space, and cap of 5
       const rawMaterials = crafting.getRawMaterials(best.recipe.id, 1);
@@ -1350,7 +1574,7 @@ export class ScoringBrain implements CommanderBrain {
     if (!this.galaxy) return baseParams;
     const galaxy = this.galaxy;
 
-    // Determine what resource type is most needed
+    // ── Demand-driven mining: figure out what ores crafters actually need ──
     // Map: POI type → ore prefixes found there
     const POI_ORE_MAP: Record<string, string[]> = {
       asteroid_belt: ["ore_iron", "ore_copper", "ore_titanium", "ore_gold", "ore_nickel", "ore_sol"],
@@ -1360,6 +1584,16 @@ export class ScoringBrain implements CommanderBrain {
       nebula: ["ore_crystal", "ore_gas"],
     };
 
+    // Reverse map: ore prefix → which POI types produce it
+    const ORE_TO_POI: Map<string, string[]> = new Map();
+    for (const [poiType, prefixes] of Object.entries(POI_ORE_MAP)) {
+      for (const prefix of prefixes) {
+        const existing = ORE_TO_POI.get(prefix) ?? [];
+        existing.push(poiType);
+        ORE_TO_POI.set(prefix, existing);
+      }
+    }
+
     // Equipment needed per POI type
     const POI_EQUIP: Record<string, string> = {
       ice_field: "ice_harvester",
@@ -1367,26 +1601,81 @@ export class ScoringBrain implements CommanderBrain {
       nebula: "gas_harvester",
     };
 
-    // Rank resource types by need (lowest faction storage = most needed)
-    const oreStock: Array<{ poiType: string; stock: number }> = [];
-    for (const [poiType, orePatterns] of Object.entries(POI_ORE_MAP)) {
-      const stock = orePatterns.reduce((sum, prefix) => {
-        let total = 0;
-        for (const [itemId, qty] of economy.factionStorage) {
-          if (itemId.startsWith(prefix)) total += qty;
+    // Compute crafter demand: what raw materials do active/best recipes consume?
+    // This creates a demand signal that miners follow, closing the supply chain loop.
+    const crafterDemand = new Map<string, number>(); // ore itemId prefix → demand score
+
+    // 1. Recipes already assigned to crafters this cycle
+    for (const a of existingAssignments) {
+      if (a.routine === "crafter" && a.params.recipeId && this.crafting) {
+        const raws = this.crafting.getRawMaterials(String(a.params.recipeId), Number(a.params.count) || 1);
+        for (const [itemId, qty] of raws) {
+          if (itemId.startsWith("ore_")) {
+            crafterDemand.set(itemId, (crafterDemand.get(itemId) ?? 0) + qty);
+          }
         }
-        return sum + total;
-      }, 0);
-      oreStock.push({ poiType, stock });
+      }
     }
-    // Deduplicate asteroid/asteroid_belt (same thing)
-    const uniqueStock = oreStock.filter((o, i, arr) =>
-      i === arr.findIndex((x) => {
-        const norm = (t: string) => t === "asteroid" ? "asteroid_belt" : t === "nebula" ? "gas_cloud" : t;
-        return norm(x.poiType) === norm(o.poiType);
-      })
-    );
-    uniqueStock.sort((a, b) => a.stock - b.stock); // Lowest stock first
+
+    // 2. If no crafters assigned yet, check top recipes by score to predict demand
+    if (crafterDemand.size === 0 && this.crafting && this.crafting.recipeCount > 0) {
+      const allRecipes = this.crafting.getAllRecipes();
+      // Score recipes by simple profitability to predict what crafters will be assigned
+      const topRecipes = allRecipes
+        .map(r => ({ recipe: r, profit: this.crafting!.estimateMarketProfit(r.id).profit }))
+        .filter(r => r.profit > 0)
+        .sort((a, b) => b.profit - a.profit)
+        .slice(0, 3);
+
+      for (const { recipe } of topRecipes) {
+        const raws = this.crafting.getRawMaterials(recipe.id, 1);
+        for (const [itemId, qty] of raws) {
+          if (itemId.startsWith("ore_")) {
+            crafterDemand.set(itemId, (crafterDemand.get(itemId) ?? 0) + qty);
+          }
+        }
+      }
+    }
+
+    // ── Score POI types: combine demand signal + storage deficit ──
+    // For each POI type, compute: demand_score = crafter_demand - current_storage
+    // Higher score = more urgently needed
+    const poiScores: Array<{ poiType: string; score: number }> = [];
+    const seenNormalized = new Set<string>();
+
+    for (const [poiType, orePatterns] of Object.entries(POI_ORE_MAP)) {
+      // Deduplicate asteroid/asteroid_belt and gas_cloud/nebula
+      const norm = poiType === "asteroid" ? "asteroid_belt" : poiType === "nebula" ? "gas_cloud" : poiType;
+      if (seenNormalized.has(norm)) continue;
+      seenNormalized.add(norm);
+
+      let demandScore = 0;
+      let storageScore = 0;
+
+      for (const prefix of orePatterns) {
+        // Sum up storage for this ore type
+        let stock = 0;
+        for (const [itemId, qty] of economy.factionStorage) {
+          if (itemId.startsWith(prefix)) stock += qty;
+        }
+
+        // Sum up crafter demand for ores matching this prefix
+        let demand = 0;
+        for (const [itemId, qty] of crafterDemand) {
+          if (itemId.startsWith(prefix)) demand += qty;
+        }
+
+        // Demand-driven: how much more ore do crafters need vs what's in storage?
+        const deficit = Math.max(0, demand - stock);
+        demandScore += deficit * 3; // Strong weight on crafter demand
+        // Also factor in low storage (general need even without active crafter assignments)
+        if (stock < 10) storageScore += (10 - stock) * 2;
+      }
+
+      poiScores.push({ poiType: norm, score: demandScore + storageScore });
+    }
+
+    poiScores.sort((a, b) => b.score - a.score); // Highest demand first
 
     // Collect belts already claimed by other miners — both this eval AND persistent active assignments
     const claimedBelts = new Set<string>();
@@ -1406,7 +1695,7 @@ export class ScoringBrain implements CommanderBrain {
       !galaxy.isPoiDepleted(poi.id) &&
       (poi.resources.length === 0 || poi.resources.some((r) => r.remaining > 0));
 
-    for (const { poiType } of uniqueStock) {
+    for (const { poiType } of poiScores) {
       // Find all POIs of this type
       const normalizedTypes = poiType === "asteroid_belt"
         ? ["asteroid_belt", "asteroid"] : poiType === "gas_cloud"
@@ -1517,31 +1806,48 @@ export class ScoringBrain implements CommanderBrain {
       asteroid: "ore",
     };
 
-    // Rank by lowest faction stock — but prioritize ice/gas over asteroid belts
-    // (harvesters add unique value for specialized extraction)
-    const oreStock: Array<{ poiType: string; stock: number; specialized: boolean }> = [];
-    for (const [poiType, orePatterns] of Object.entries(POI_ORE_MAP)) {
-      const stock = orePatterns.reduce((sum, prefix) => {
-        let total = 0;
-        for (const [itemId, qty] of economy.factionStorage) {
-          if (itemId.startsWith(prefix)) total += qty;
+    // ── Demand-driven harvesting: factor crafter needs + specialization ──
+    // Compute crafter demand for ores (same as miner logic)
+    const harvesterCrafterDemand = new Map<string, number>();
+    for (const a of existingAssignments) {
+      if (a.routine === "crafter" && a.params.recipeId && this.crafting) {
+        const raws = this.crafting.getRawMaterials(String(a.params.recipeId), Number(a.params.count) || 1);
+        for (const [itemId, qty] of raws) {
+          if (itemId.startsWith("ore_")) {
+            harvesterCrafterDemand.set(itemId, (harvesterCrafterDemand.get(itemId) ?? 0) + qty);
+          }
         }
-        return sum + total;
-      }, 0);
-      oreStock.push({ poiType, stock, specialized: poiType in POI_EQUIP });
+      }
     }
-    // Deduplicate asteroid/asteroid_belt and gas_cloud/nebula
-    const uniqueStock = oreStock.filter((o, i, arr) =>
-      i === arr.findIndex((x) => {
-        const norm = (t: string) => t === "asteroid" ? "asteroid_belt" : t === "nebula" ? "gas_cloud" : t;
-        return norm(x.poiType) === norm(o.poiType);
-      })
-    );
-    // Sort: specialized (ice/gas) first by stock, then asteroid belts by stock
-    uniqueStock.sort((a, b) => {
-      if (a.specialized !== b.specialized) return a.specialized ? -1 : 1;
-      return a.stock - b.stock;
-    });
+
+    // Score POI types: combine demand signal + storage deficit + specialization bonus
+    const harvesterPoiScores: Array<{ poiType: string; score: number; specialized: boolean }> = [];
+    const harvesterSeen = new Set<string>();
+    for (const [poiType, orePatterns] of Object.entries(POI_ORE_MAP)) {
+      const norm = poiType === "asteroid" ? "asteroid_belt" : poiType === "nebula" ? "gas_cloud" : poiType;
+      if (harvesterSeen.has(norm)) continue;
+      harvesterSeen.add(norm);
+
+      const specialized = norm in POI_EQUIP;
+      let score = specialized ? 30 : 0; // Harvesters prefer specialized extraction
+
+      for (const prefix of orePatterns) {
+        let stock = 0;
+        for (const [itemId, qty] of economy.factionStorage) {
+          if (itemId.startsWith(prefix)) stock += qty;
+        }
+        let demand = 0;
+        for (const [itemId, qty] of harvesterCrafterDemand) {
+          if (itemId.startsWith(prefix)) demand += qty;
+        }
+        const deficit = Math.max(0, demand - stock);
+        score += deficit * 3;
+        if (stock < 10) score += (10 - stock) * 2;
+      }
+
+      harvesterPoiScores.push({ poiType: norm, score, specialized });
+    }
+    harvesterPoiScores.sort((a, b) => b.score - a.score);
 
     // Collect POIs already claimed by miners or harvesters (this eval + persistent)
     const claimedPois = new Set<string>();
@@ -1566,7 +1872,7 @@ export class ScoringBrain implements CommanderBrain {
       (poi.resources.length === 0 || poi.resources.some((r) => r.remaining > 0));
 
     // Find the best POI type to harvest
-    for (const { poiType } of uniqueStock) {
+    for (const { poiType } of harvesterPoiScores) {
       const normalizedTypes = poiType === "asteroid_belt"
         ? ["asteroid_belt", "asteroid"] : poiType === "gas_cloud"
         ? ["gas_cloud", "nebula"] : [poiType];

@@ -111,6 +111,9 @@ export class BotManager {
         ownedShips: bot.ownedShips,
         skills: bot.skillLevels,
         rapidRoutines: bot.rapidRoutines,
+        moduleWear: ship?.modules.length
+          ? ship.modules.reduce((sum, m) => sum + ((m as any).durability ?? (m as any).health ?? 100), 0) / ship.modules.length
+          : 100,
       });
 
       totalCredits += player?.credits ?? 0;

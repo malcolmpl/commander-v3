@@ -16,6 +16,8 @@ export class Galaxy {
   private baseToSystem = new Map<string, string>(); // baseId → systemId
   /** POIs explicitly marked as depleted by miners (distinct from "never scanned") */
   private depletedPois = new Set<string>();
+  /** Timestamp of last resource scan per POI */
+  private poiScannedAt = new Map<string, number>();
   /** Dirty flag: set when galaxy data changes, cleared after broadcast */
   dirty = true;
 
@@ -92,7 +94,7 @@ export class Galaxy {
     connections: string[];
     poiCount: number;
     visited: boolean;
-    pois: Array<{ id: string; name: string; type: string; hasBase: boolean; baseName: string | null; resources: Array<{ resourceId: string; richness: number; remaining: number }> }>;
+    pois: Array<{ id: string; name: string; type: string; hasBase: boolean; baseId: string | null; baseName: string | null; resources: Array<{ resourceId: string; richness: number; remaining: number }>; scannedAt: number }>;
   }> {
     const results = [];
     for (const node of this.graph.values()) {
@@ -112,12 +114,14 @@ export class Galaxy {
           name: p.name,
           type: p.type,
           hasBase: p.hasBase,
+          baseId: p.baseId ?? null,
           baseName: p.baseName ?? null,
           resources: (p.resources ?? []).map((r) => ({
             resourceId: r.resourceId,
             richness: r.richness,
             remaining: r.remaining,
           })),
+          scannedAt: this.poiScannedAt.get(p.id) ?? 0,
         })),
       });
     }
@@ -259,7 +263,14 @@ export class Galaxy {
     const entry = this.poiIndex.get(poiId);
     if (entry) {
       entry.poi.resources = resources;
+      this.poiScannedAt.set(poiId, Date.now());
+      this.dirty = true;
     }
+  }
+
+  /** Get last scan timestamp for a POI's resources */
+  getPoiScannedAt(poiId: string): number {
+    return this.poiScannedAt.get(poiId) ?? 0;
   }
 
   /** Mark a POI as depleted (distinct from "never scanned" which also has empty resources) */

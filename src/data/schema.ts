@@ -253,3 +253,43 @@ export const poiCache = sqliteTable("poi_cache", {
 }, (table) => [
   index("idx_poi_system").on(table.systemId),
 ]);
+
+// ── Faction Transaction Log (deposits, withdrawals, credits) ──
+
+export const factionTransactions = sqliteTable("faction_transactions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  timestamp: integer("timestamp").notNull(),
+  botId: text("bot_id"),
+  type: text("type").notNull(), // "item_deposit" | "item_withdraw" | "credit_deposit" | "credit_withdraw" | "sell_order" | "buy_order"
+  itemId: text("item_id"),
+  itemName: text("item_name"),
+  quantity: integer("quantity"),
+  credits: real("credits"),
+  details: text("details"),
+}, (table) => [
+  index("idx_faction_tx_ts").on(table.timestamp),
+  index("idx_faction_tx_type").on(table.type),
+]);
+
+// ── Activity Log (bot routine state changes, persisted for dashboard history) ──
+
+export const activityLog = sqliteTable("activity_log", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  timestamp: integer("timestamp").notNull(),
+  level: text("level").notNull().default("info"),
+  botId: text("bot_id"),
+  message: text("message").notNull(),
+  details: text("details"),
+}, (table) => [
+  index("idx_activity_ts").on(table.timestamp),
+  index("idx_activity_bot").on(table.botId),
+]);
+
+// ── Commander Memory (persistent knowledge base, inspired by CHAPERON) ──
+
+export const commanderMemory = sqliteTable("commander_memory", {
+  key: text("key").primaryKey(),
+  fact: text("fact").notNull(),
+  importance: integer("importance").notNull().default(5),
+  updatedAt: text("updated_at").default(sql`(datetime('now'))`),
+});

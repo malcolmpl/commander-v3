@@ -8,6 +8,7 @@ import type { DB } from "./db";
 import {
   decisionLog, stateSnapshots, episodes, marketHistory,
   commanderLog, financialEvents, tradeLog, llmDecisions,
+  factionTransactions,
 } from "./schema";
 
 const COMMANDER_VERSION = "3.0.0";
@@ -180,6 +181,12 @@ export class TrainingLogger {
     }).run();
   }
 
+  logFactionCreditTx(type: "credit_deposit" | "credit_withdraw", botId: string, amount: number, details?: string): void {
+    this.db.insert(factionTransactions).values({
+      timestamp: Date.now(), botId, type, credits: amount, details: details ?? null,
+    }).run();
+  }
+
   getFinancialHistory(sinceMs: number, bucketMs: number): Array<{
     timestamp: number; revenue: number; cost: number; profit: number;
   }> {
@@ -210,6 +217,22 @@ export class TrainingLogger {
       itemId: params.itemId, quantity: params.quantity, priceEach: params.priceEach,
       total: params.total, stationId: params.stationId ?? null,
     }).run();
+  }
+
+  /** Get 24h revenue/cost/profit totals from persisted financial events */
+  get24hFinancialTotals(): { revenue: number; cost: number; profit: number } {
+    const since = Date.now() - 24 * 60 * 60 * 1000;
+    const rows = this.db.all(sql`
+      SELECT
+        SUM(CASE WHEN ${financialEvents.eventType} = 'revenue' THEN ${financialEvents.amount} ELSE 0 END) as revenue,
+        SUM(CASE WHEN ${financialEvents.eventType} = 'cost' THEN ${financialEvents.amount} ELSE 0 END) as cost
+      FROM ${financialEvents}
+      WHERE ${financialEvents.timestamp} >= ${since}
+    `) as Array<{ revenue: number | null; cost: number | null }>;
+    const r = rows[0] ?? { revenue: 0, cost: 0 };
+    const revenue = r.revenue ?? 0;
+    const cost = r.cost ?? 0;
+    return { revenue, cost, profit: revenue - cost };
   }
 
   getRecentTrades(sinceMs: number, limit = 100): Array<{
@@ -309,5 +332,43 @@ export class TrainingLogger {
     const dbSizeBytes = file.size;
 
     return { decisions, snapshots, episodes: episodeCount, marketRecords, commanderDecisions, dbSizeBytes };
+  }
+
+  /** Get per-brain decision breakdown for dashboard */
+  getBrainDecisionStats(): {
+    total: number;
+    byBrain: Array<{ brainName: string; count: number; avgLatency: number; avgConfidence: number }>;
+    recentBrainName: string | null;
+  } {
+    const total = (this.db.all(sql`SELECT COUNT(*) as count FROM ${llmDecisions}`) as Array<{ count: number }>)[0]?.count ?? 0;
+
+    const byBrain = this.db.all(sql`
+      SELECT
+        ${llmDecisions.brainName} as brain_name,
+        COUNT(*) as count,
+        AVG(${llmDecisions.latencyMs}) as avg_latency,
+        AVG(${llmDecisions.confidence}) as avg_confidence
+      FROM ${llmDecisions}
+      GROUP BY ${llmDecisions.brainName}
+    `) as Array<{ brain_name: string; count: number; avg_latency: number; avg_confidence: number }>;
+
+    // Most recent brain used
+    const recent = this.db.all(sql`
+      SELECT ${llmDecisions.brainName} as brain_name
+      FROM ${llmDecisions}
+      ORDER BY ${llmDecisions.tick} DESC
+      LIMIT 1
+    `) as Array<{ brain_name: string }>;
+
+    return {
+      total,
+      byBrain: byBrain.map(r => ({
+        brainName: r.brain_name,
+        count: r.count,
+        avgLatency: Math.round(r.avg_latency ?? 0),
+        avgConfidence: r.avg_confidence ?? 0,
+      })),
+      recentBrainName: recent[0]?.brain_name ?? null,
+    };
   }
 }

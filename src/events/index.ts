@@ -16,4 +16,5 @@ export {
 export { registerTradeTracker } from "./handlers/trade-tracker";
 export { registerProductionTracker, createProductionStats, type ProductionStats } from "./handlers/production-tracker";
 export { registerDashboardRelay, type BroadcastFn } from "./handlers/dashboard-relay";
+export { registerFactionTracker } from "./handlers/faction-tracker";
 export { registerScoutPropagator, type ScoutPropagatorDeps } from "./handlers/scout-propagator";

@@ -17,6 +17,7 @@ import { Combat } from "./core/combat";
 import { Crafting } from "./core/crafting";
 import { Station } from "./core/station";
 import { EventBus } from "./events/bus";
+import { registerTradeTracker, registerProductionTracker, registerDashboardRelay, registerFactionTracker, createProductionStats } from "./events";
 import { BotManager, type SharedServices, type ApiClientFactory } from "./bot/bot-manager";
 import { ApiClient } from "./core/api-client";
 import { Commander, type CommanderConfig, type CommanderDeps } from "./commander/commander";
@@ -27,7 +28,9 @@ import { createGeminiBrain } from "./commander/gemini-brain";
 import { createClaudeBrain } from "./commander/claude-brain";
 import { EconomyEngine } from "./commander/economy-engine";
 import { buildRoutineRegistry } from "./routines";
-import { createServer, type ServerOptions } from "./server/server";
+import { createServer, broadcast, sendTo, type ServerOptions } from "./server/server";
+import { activityLog } from "./data/schema";
+import { gt } from "drizzle-orm";
 import { handleClientMessage, type MessageRouterDeps } from "./server/message-router";
 import { startBroadcastLoop, type BroadcastDeps } from "./server/broadcast";
 import {
@@ -36,6 +39,7 @@ import {
   ensureFactionMembership,
 } from "./fleet";
 import type { CommanderBrain } from "./commander/types";
+import { MemoryStore } from "./data/memory-store";
 
 export interface AppServices {
   db: DB;
@@ -58,6 +62,12 @@ export async function startup(config: AppConfig): Promise<AppServices> {
   const gameCache = new GameCache(db, trainingLogger);
   const sessionStore = new SessionStore(db);
   const eventBus = new EventBus();
+
+  // ── Event Handlers ──
+  registerTradeTracker(eventBus, trainingLogger);
+  registerFactionTracker(eventBus, db);
+  const productionStats = createProductionStats();
+  registerProductionTracker(eventBus, productionStats);
 
   // ── Core Services ──
   const galaxy = new Galaxy();
@@ -111,8 +121,62 @@ export async function startup(config: AppConfig): Promise<AppServices> {
   // Register routines
   botManager.registerRoutines(buildRoutineRegistry());
 
+  // ── Log Persistence + Broadcast ──
+  // Wire bot state changes to persist in DB and broadcast to dashboard
+  const LOG_BATCH_INTERVAL_MS = 2_000;
+  const MAX_LOG_BATCH = 50;
+  let logBatch: Array<{ timestamp: number; level: string; botId: string | null; message: string }> = [];
+  let logFlushTimer: ReturnType<typeof setInterval> | null = null;
+
+  const flushLogs = () => {
+    if (logBatch.length === 0) return;
+    const batch = logBatch.splice(0, MAX_LOG_BATCH);
+    try {
+      const insertLog = db.insert(activityLog);
+      for (const entry of batch) {
+        insertLog.values({
+          timestamp: entry.timestamp,
+          level: entry.level,
+          botId: entry.botId,
+          message: entry.message,
+        }).run();
+      }
+    } catch (err) {
+      console.error(`[Log] Failed to flush ${batch.length} log entries:`, err);
+    }
+  };
+
+  logFlushTimer = setInterval(flushLogs, LOG_BATCH_INTERVAL_MS);
+
+  botManager.onBotStateChange = (botId: string, routine: string, state: string) => {
+    const entry = {
+      timestamp: Date.now(),
+      level: "info" as const,
+      botId,
+      message: `${routine}: ${state}`,
+    };
+
+    // Buffer for DB persistence
+    logBatch.push(entry);
+    if (logBatch.length >= MAX_LOG_BATCH) flushLogs();
+
+    // Broadcast live to connected dashboards
+    broadcast({
+      type: "log_entry",
+      entry: {
+        timestamp: new Date(entry.timestamp).toISOString(),
+        level: entry.level,
+        botId: entry.botId,
+        message: entry.message,
+      },
+    });
+  };
+
   // ── Economy Engine ──
   const economy = new EconomyEngine();
+
+  // ── Persistent Memory Store (inspired by CHAPERON) ──
+  const memoryStore = new MemoryStore(db);
 
   // ── Commander Brain ──
   const brain = buildBrain(config, trainingLogger);
@@ -136,6 +200,7 @@ export async function startup(config: AppConfig): Promise<AppServices> {
       return readyBot?.api ?? null;
     },
     homeBase: config.fleet.home_base || undefined,
+    memoryStore,
   };
 
   const commander = new Commander(commanderConfig, commanderDeps, brain);
@@ -160,24 +225,46 @@ export async function startup(config: AppConfig): Promise<AppServices> {
     console.log(`[Fleet] Loaded ${savedBots.length} bots from session store`);
   }
 
-  // ── Galaxy Loading ──
-  let galaxyLoaded = false;
+  // ── Galaxy + Catalog Loading ──
+  let shipCatalogLoaded = false;
   const ensureGalaxyLoaded = async () => {
-    if (galaxyLoaded) return;
-    const readyBot = botManager.getAllBots().find(b => b.api);
-    if (readyBot?.api) {
-      try {
-        const systems = await readyBot.api.getMap();
-        if (systems) {
-          galaxy.load(systems);
-          galaxyLoaded = true;
-          console.log(`[Galaxy] Loaded ${galaxy.getAllSystems().length} systems`);
+    // Full galaxy + recipe + item loading via BotManager
+    await botManager.loadGalaxy();
+
+    // Ship catalog for upgrade system
+    if (!shipCatalogLoaded) {
+      const readyBot = botManager.getAllBots().find(b => b.api);
+      if (readyBot?.api) {
+        try {
+          const shipCatalog = await gameCache.getShipCatalog(readyBot.api);
+          if (shipCatalog.length > 0) {
+            commander.setShipCatalog(shipCatalog);
+            shipCatalogLoaded = true;
+          }
+        } catch (err) {
+          console.log(`[Fleet] Failed to load ship catalog: ${err instanceof Error ? err.message : err}`);
         }
-      } catch (err) {
-        console.log(`[Galaxy] Failed to load: ${err instanceof Error ? err.message : err}`);
       }
     }
   };
+
+  // ── Faction Discovery (async, non-blocking, retries every 60s) ──
+  let discoveryTimer: ReturnType<typeof setInterval> | null = null;
+  const runDiscovery = async () => {
+    if (botManager.fleetConfig.homeBase && botManager.fleetConfig.factionStorageStation) return; // Already found
+    const result = await discoverFactionStorage(botManager, galaxy, db);
+    if (result) {
+      propagateFleetHome(botManager, result.stationId, result.systemId);
+      if (discoveryTimer) {
+        clearInterval(discoveryTimer);
+        discoveryTimer = null;
+      }
+      // Force commander re-eval now that home config is populated
+      commander.forceEvaluation();
+    }
+  };
+  runDiscovery(); // Initial attempt (will likely fail before bots login)
+  discoveryTimer = setInterval(runDiscovery, 60_000); // Retry every 60s until found
 
   // ── Web Server ──
   const routerDeps: MessageRouterDeps = {
@@ -185,7 +272,9 @@ export async function startup(config: AppConfig): Promise<AppServices> {
     commander,
     galaxy,
     db,
+    cache: gameCache,
     ensureGalaxyLoaded,
+    runDiscovery,
   };
 
   const serverOpts: ServerOptions = {
@@ -197,10 +286,53 @@ export async function startup(config: AppConfig): Promise<AppServices> {
     onClientMessage: (ws, msg) => handleClientMessage(ws, msg, routerDeps),
     onClientConnect: (ws) => {
       console.log("[WS] New client — sending initial state");
+      // Send fleet settings so dashboard populates immediately
+      sendTo(ws, {
+        type: "fleet_settings_update",
+        settings: {
+          factionTaxPercent: botManager.fleetConfig.factionTaxPercent,
+          minBotCredits: botManager.fleetConfig.minBotCredits,
+          homeSystem: botManager.fleetConfig.homeSystem,
+          homeBase: botManager.fleetConfig.homeBase,
+          defaultStorageMode: botManager.fleetConfig.defaultStorageMode,
+        },
+      } as any);
+
+      // Send recent log entries from DB so dashboard has history
+      try {
+        const since = Date.now() - 3_600_000; // Last hour
+        const recentLogs = db.select().from(activityLog)
+          .where(gt(activityLog.timestamp, since))
+          .orderBy(activityLog.timestamp)
+          .limit(200)
+          .all();
+        for (const row of recentLogs) {
+          sendTo(ws, {
+            type: "log_entry",
+            entry: {
+              timestamp: new Date(row.timestamp).toISOString(),
+              level: row.level as any,
+              botId: row.botId,
+              message: row.message,
+            },
+          });
+        }
+      } catch {
+        // Non-critical — dashboard will fill from live events
+      }
+
+      // Send last commander decision
+      const lastDecision = commander.getLastDecision();
+      if (lastDecision) {
+        sendTo(ws, { type: "commander_decision", decision: lastDecision });
+      }
     },
   };
 
   createServer(serverOpts);
+
+  // Register dashboard relay (forward game events to WebSocket clients)
+  registerDashboardRelay(eventBus, broadcast as any);
 
   // ── Broadcast Loop ──
   const broadcastDeps: BroadcastDeps = {
@@ -209,22 +341,24 @@ export async function startup(config: AppConfig): Promise<AppServices> {
     economy,
     galaxy,
     db,
+    startTime: Date.now(),
+    trainingLogger,
   };
 
   const stopBroadcast = startBroadcastLoop(broadcastDeps);
 
-  // ── Faction Discovery (async, non-blocking) ──
-  (async () => {
-    const result = await discoverFactionStorage(botManager, galaxy, db);
-    if (result) {
-      propagateFleetHome(botManager, result.stationId, result.systemId);
-    }
-  })();
-
   // ── Start Commander Eval Loop ──
   commander.start();
 
-  return { db, close: () => sqlite.close(), galaxy, botManager, commander, economy, sessionStore, stopBroadcast };
+  return {
+    db,
+    close: () => {
+      if (logFlushTimer) clearInterval(logFlushTimer);
+      flushLogs(); // Flush remaining logs before close
+      sqlite.close();
+    },
+    galaxy, botManager, commander, economy, sessionStore, stopBroadcast,
+  };
 }
 
 /** Build the brain based on config */
@@ -240,6 +374,7 @@ function buildBrain(config: AppConfig, logger: TrainingLogger): CommanderBrain {
   // Build LLM brains for tiered system
   const brainMap: Record<string, () => CommanderBrain> = {
     ollama: () => createOllamaBrain({
+      baseUrl: config.ai.ollama_base_url,
       model: config.ai.ollama_model,
       timeoutMs: config.ai.max_latency_ms,
     }),

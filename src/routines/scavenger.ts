@@ -181,8 +181,8 @@ export async function* scavenger(ctx: BotContext): AsyncGenerator<RoutineYield, 
       if (!handled) return;
     }
 
-    // Periodic wreck memory clear
-    if (Date.now() - lastWreckClear > WRECK_RESET_INTERVAL) {
+    // Periodic wreck memory clear (also cap size to prevent memory leak)
+    if (Date.now() - lastWreckClear > WRECK_RESET_INTERVAL || attemptedWrecks.size > 200) {
       attemptedWrecks.clear();
       lastWreckClear = Date.now();
     }

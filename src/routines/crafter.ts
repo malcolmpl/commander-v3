@@ -42,21 +42,23 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
   const materialSource = getParam<string>(ctx, "materialSource", "cargo");
   const sellOutput = getParam(ctx, "sellOutput", true);
   let skillTraining = false;
+  const facilityOnlyRecipes = new Set<string>(); // Blacklist recipes that require production facilities
 
   // ── Recipe discovery ──
-  if (!recipeId) {
+  if (!recipeId || facilityOnlyRecipes.has(recipeId)) {
+    if (facilityOnlyRecipes.has(recipeId)) recipeId = ""; // Reset blacklisted recipe
     yield "analyzing recipes...";
 
     // First: try to find something we can craft right now
     const immediate = ctx.crafting.findCraftableNow(ctx.ship, ctx.player.skills);
-    if (immediate) {
+    if (immediate && !facilityOnlyRecipes.has(immediate.id)) {
       recipeId = immediate.id;
       const { profit, hasMarketData } = ctx.crafting.estimateMarketProfit(immediate.id);
       yield `ready to craft: ${immediate.name} (est. profit ${profit}cr${hasMarketData ? " mkt" : ""})`;
     } else {
       // Second: find the most profitable recipe we have skills for
       const best = ctx.crafting.findBestRecipe(ctx.player.skills);
-      if (best) {
+      if (best && !facilityOnlyRecipes.has(best.id)) {
         recipeId = best.id;
         const { profit, hasMarketData } = ctx.crafting.estimateMarketProfit(best.id);
         yield `target recipe: ${best.name} (est. profit ${profit}cr${hasMarketData ? " mkt" : ""}, need materials)`;
@@ -100,6 +102,8 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
       .join(", ");
     yield `chain: ${chain.length} steps. Raw materials needed: ${rawList}`;
   }
+
+  let noSellCount = 0; // Track consecutive no-demand cycles — bail after 3 to avoid infinite loops
 
   while (!ctx.shouldStop) {
     // ── Clear leftover cargo from previous failed cycles ──
@@ -212,7 +216,20 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
           }
         }
       } catch (err) {
-        yield `craft failed: ${err instanceof Error ? err.message : String(err)}`;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        yield `craft failed: ${errMsg}`;
+
+        // Facility-only recipes can never be manually crafted — blacklist and abort
+        if (errMsg.includes("facility-only") || errMsg.includes("facility_only")) {
+          facilityOnlyRecipes.add(step.recipeId);
+          yield `blacklisted ${step.recipeName} (facility-only recipe)`;
+          // If this is the top-level recipe, bail out entirely
+          if (step.recipeId === recipeId) {
+            yield typedYield("cycle_complete", { type: "cycle_complete", botId: ctx.botId, routine: "crafter" });
+            return;
+          }
+        }
+
         chainFailed = true;
         break; // Exit chain loop — will wait and retry
       }
@@ -233,6 +250,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
       yield `selling ${ctx.crafting.getItemName(recipe.outputItem)}`;
       const result = await sellItem(ctx, recipe.outputItem);
       if (result && result.total > 0) {
+        noSellCount = 0; // Reset — demand exists
         yield `sold ${result.quantity} ${recipe.outputItem} @ ${result.priceEach}cr (total: ${result.total}cr)`;
         // Record sell as demand signal for arbitrage
         if (ctx.player.dockedAtBase) {
@@ -249,9 +267,18 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
             yield `no demand — deposited ${unsoldQty} ${ctx.crafting.getItemName(recipe.outputItem)} to faction storage`;
           } catch {
             yield `no demand for ${ctx.crafting.getItemName(recipe.outputItem)} (deposit also failed)`;
+            // Can't sell AND can't deposit — recipe is completely unproductive, bail out
+            yield "stopping: output unsellable and storage full";
+            return;
           }
         } else {
           yield `no demand for ${ctx.crafting.getItemName(recipe.outputItem)}`;
+        }
+        // Track consecutive no-demand cycles — bail after 3 to avoid infinite algae loops
+        noSellCount++;
+        if (noSellCount >= 3) {
+          yield `stopping: ${noSellCount} consecutive cycles with no demand for ${ctx.crafting.getItemName(recipe.outputItem)}`;
+          return;
         }
       }
     } else {
@@ -405,6 +432,13 @@ async function sourceMaterials(
             } else {
               const result = await ctx.api.buy(ing.itemId, safeBuyQty);
               await ctx.refreshState();
+              if (result.total > 0) {
+                ctx.eventBus.emit({
+                  type: "trade_buy", botId: ctx.botId, itemId: ing.itemId, quantity: result.quantity,
+                  priceEach: result.priceEach, total: result.total,
+                  stationId: ctx.player.dockedAtBase ?? "",
+                });
+              }
               if (result.priceEach > MAX_MATERIAL_BUY_PRICE) {
                 // Bought at an unexpectedly high price — warn but keep the items
                 messages.push(`WARNING: bought ${result.quantity} ${ctx.crafting.getItemName(ing.itemId)} @ ${result.priceEach}cr (above ${MAX_MATERIAL_BUY_PRICE}cr cap)`);

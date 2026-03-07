@@ -26,6 +26,21 @@
 		send({ type: "remove_bot", botId: id });
 		confirmRemove = null;
 	}
+
+	function startAll() {
+		send({ type: "start_all_bots" });
+	}
+
+	function stopAll() {
+		for (const bot of $bots) {
+			if (bot.status === "running" || bot.status === "error") {
+				send({ type: "stop_bot", botId: bot.id });
+			}
+		}
+	}
+
+	const hasStoppedBots = $derived($bots.some(b => b.status === "idle" || b.status === "ready" || b.status === "error"));
+	const hasRunningBots = $derived($bots.some(b => b.status === "running" || b.status === "error"));
 </script>
 
 <svelte:head>
@@ -35,12 +50,30 @@
 <div class="space-y-4">
 	<div class="flex items-center justify-between">
 		<h1 class="text-2xl font-bold text-star-white">Bot Management</h1>
-		<button
-			class="px-4 py-2 bg-plasma-cyan/20 text-plasma-cyan border border-plasma-cyan/30 rounded-lg text-sm font-medium hover:bg-plasma-cyan/30 transition-colors"
-			onclick={() => (showAddDialog = true)}
-		>
-			+ Add Bot
-		</button>
+		<div class="flex gap-2">
+			{#if $bots.length > 0 && hasRunningBots}
+				<button
+					class="px-4 py-2 bg-claw-red/20 text-claw-red border border-claw-red/30 rounded-lg text-sm font-medium hover:bg-claw-red/30 transition-colors"
+					onclick={stopAll}
+				>
+					Stop All
+				</button>
+			{/if}
+			{#if $bots.length > 0 && hasStoppedBots}
+				<button
+					class="px-4 py-2 bg-bio-green/20 text-bio-green border border-bio-green/30 rounded-lg text-sm font-medium hover:bg-bio-green/30 transition-colors"
+					onclick={startAll}
+				>
+					Start All
+				</button>
+			{/if}
+			<button
+				class="px-4 py-2 bg-plasma-cyan/20 text-plasma-cyan border border-plasma-cyan/30 rounded-lg text-sm font-medium hover:bg-plasma-cyan/30 transition-colors"
+				onclick={() => (showAddDialog = true)}
+			>
+				+ Add Bot
+			</button>
+		</div>
 	</div>
 
 	<!-- Fleet summary -->

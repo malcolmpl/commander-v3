@@ -131,8 +131,36 @@ export async function* trader(ctx: BotContext): AsyncGenerator<RoutineYield, voi
   let minSellPrice = getParam(ctx, "minSellPrice", 0);
   const maxRoundTrips = getParam(ctx, "maxRoundTrips", Infinity);
   const useOrders = getParam(ctx, "useOrders", false);
-  const sellFromFaction = getParam(ctx, "sellFromFaction", false);
+  let sellFromFaction = getParam(ctx, "sellFromFaction", false);
   const enableArbitrage = getParam(ctx, "enableArbitrage", false);
+  const traderIndex = getParam(ctx, "traderIndex", 0);
+
+  // Commander-assigned route (from scoring brain's arbitrage analysis)
+  const assignedItem = getParam(ctx, "assignedItem", "");
+  const assignedBuyStation = getParam(ctx, "assignedBuyStation", "");
+  const assignedSellStation = getParam(ctx, "assignedSellStation", "");
+  const maxBuyQty = getParam(ctx, "maxBuyQty", Infinity);
+  const expectedBuyPrice = getParam(ctx, "expectedBuyPrice", 0);
+  const expectedSellPrice = getParam(ctx, "expectedSellPrice", 0);
+
+  // Use commander-assigned route if provided
+  if (assignedItem && assignedBuyStation && assignedSellStation) {
+    item = assignedItem;
+    buyStation = assignedBuyStation;
+    sellStation = assignedSellStation;
+    maxBuyPrice = expectedBuyPrice > 0 ? expectedBuyPrice * 1.05 : Infinity; // 5% tolerance
+    minSellPrice = expectedSellPrice > 0 ? expectedSellPrice * 0.90 : 0; // 10% tolerance
+    yield `commander-assigned route: ${assignedItem} ${assignedBuyStation} → ${assignedSellStation} (max ${maxBuyQty} units)`;
+  }
+
+  // Auto-detect: if no explicit trade route and faction storage is configured, use faction sell
+  if (!sellFromFaction && !buyStation && !sellStation && !item) {
+    const factionStation = ctx.fleetConfig.factionStorageStation || ctx.fleetConfig.homeBase;
+    if (factionStation) {
+      sellFromFaction = true;
+      yield "auto-detected faction sell mode (no explicit trade route)";
+    }
+  }
 
   // Guard: traders don't trade ores (miners handle those via supply chain)
   if (item && isOre(item)) {
@@ -221,9 +249,10 @@ export async function* trader(ctx: BotContext): AsyncGenerator<RoutineYield, voi
       }
     }
 
-    // Use best route initially
+    // Use best route for this trader (offset by traderIndex for deconfliction)
     if (candidateRoutes.length > 0) {
-      const best = candidateRoutes[0];
+      const routeOffset = Math.min(traderIndex, candidateRoutes.length - 1);
+      const best = candidateRoutes[routeOffset];
       if (!item) item = best.itemId;
       if (!buyStation) buyStation = best.buyStation;
       if (!sellStation) sellStation = best.sellStation;
@@ -453,6 +482,10 @@ export async function* trader(ctx: BotContext): AsyncGenerator<RoutineYield, voi
         const sellDemandVol = sellStationPrices?.find((p) => p.itemId === item)?.sellVolume ?? 0;
         if (sellDemandVol > 0) {
           buyQty = Math.min(buyQty, sellDemandVol);
+        }
+        // Cap by commander-assigned volume limit (prevents multiple traders over-buying)
+        if (maxBuyQty < Infinity) {
+          buyQty = Math.min(buyQty, maxBuyQty);
         }
 
         if (buyQty <= 0) {
@@ -1137,7 +1170,10 @@ async function* factionSellLoop(
     // Only consider items with KNOWN buyers (cached sellPrice > 0 at some station).
     // This prevents blind withdrawals that end up re-deposited.
     const cachedStations = ctx.cache.getAllMarketFreshness().map((f) => f.stationId);
-    const nonOreStorage = storageItems.filter((s) => !isOre(s.itemId) && s.quantity > 0);
+    // Include non-ore items + ores with 5000+ units (overstocked, need to sell)
+    const nonOreStorage = storageItems.filter((s) =>
+      s.quantity > 0 && (!isOre(s.itemId) || s.quantity >= 5000)
+    );
 
     // Build a ranked list of stations by total revenue for items in storage
     const stationBids: Array<{

@@ -12,6 +12,7 @@ import type { BotContext } from "../bot/types";
 import type { RoutineYield } from "../events/types";
 import { typedYield } from "../events/types";
 import {
+  navigateTo,
   navigateToPoi,
   navigateAndDock,
   findAndDock,
@@ -74,8 +75,53 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<RoutineYield, 
     }
   }
 
+  // Galaxy-wide fallback: search nearby systems for resource POIs
   if (rawTargets.length === 0) {
-    yield "error: no harvest targets found in current system";
+    yield "no targets locally, searching galaxy...";
+    const hasIceHarvester = ctx.ship.modules.some((m) =>
+      m.moduleId.includes("ice_harvester") || m.name.toLowerCase().includes("ice harvester")
+    );
+    const hasGasHarvester = ctx.ship.modules.some((m) =>
+      m.moduleId.includes("gas_harvester") || m.name.toLowerCase().includes("gas harvester")
+    );
+    const poiTypes: string[] = ["asteroid_belt", "asteroid"];
+    if (hasIceHarvester) poiTypes.push("ice_field");
+    if (hasGasHarvester) poiTypes.push("gas_cloud", "nebula");
+
+    let bestPoi: { systemId: string; poiId: string; distance: number } | null = null;
+    for (const type of poiTypes) {
+      const pois = ctx.galaxy.findPoisByType(type as any);
+      for (const { systemId, poi } of pois) {
+        if (ctx.galaxy.isPoiDepleted(poi.id)) continue;
+        if (poi.resources.length > 0 && poi.resources.every((r) => r.remaining <= 0)) continue;
+        const distance = ctx.galaxy.getDistance(ctx.player.currentSystem, systemId);
+        if (distance < 0 || distance > 5) continue; // Max 5 jumps
+        if (!bestPoi || distance < bestPoi.distance) {
+          bestPoi = { systemId, poiId: poi.id, distance };
+        }
+      }
+    }
+
+    if (bestPoi) {
+      yield `found resource POI ${bestPoi.distance} jump(s) away, navigating`;
+      try {
+        await navigateTo(ctx, bestPoi.systemId, bestPoi.poiId);
+        rawTargets = [{ poiId: bestPoi.poiId, priority: 1 }];
+        // Find deposit station in target system
+        if (!depositStation) {
+          const targetSys = ctx.galaxy.getSystem(bestPoi.systemId);
+          const station = targetSys?.pois.find((p) => p.hasBase);
+          if (station?.baseId) depositStation = station.baseId;
+        }
+      } catch (err) {
+        yield `navigation failed: ${err instanceof Error ? err.message : String(err)}`;
+        return;
+      }
+    }
+  }
+
+  if (rawTargets.length === 0) {
+    yield "error: no harvest targets found in galaxy";
     return;
   }
 
@@ -198,6 +244,13 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<RoutineYield, 
         try {
           const result = await ctx.api.sell(item.itemId, item.quantity);
           yield `sold ${result.quantity} ${item.itemId} @ ${result.priceEach}cr = ${result.total}cr`;
+          if (result.total > 0) {
+            ctx.eventBus.emit({
+              type: "trade_sell", botId: ctx.botId, itemId: item.itemId, quantity: result.quantity,
+              priceEach: result.priceEach, total: result.total,
+              stationId: ctx.player.dockedAtBase ?? "",
+            });
+          }
         } catch {
           yield `sell also failed for ${item.itemId}, skipping`;
         }

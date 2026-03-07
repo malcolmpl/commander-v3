@@ -73,6 +73,9 @@
 		snapshotInterval: 30,
 		factionTaxPercent: 0,
 		minBotCredits: 0,
+		homeSystem: "",
+		homeBase: "",
+		defaultStorageMode: "faction_deposit" as string,
 	});
 
 	// Economy settings
@@ -89,6 +92,9 @@
 		const fs = $fleetSettingsStore;
 		fleetSettings.factionTaxPercent = fs.factionTaxPercent;
 		fleetSettings.minBotCredits = fs.minBotCredits;
+		if ((fs as any).homeSystem) fleetSettings.homeSystem = (fs as any).homeSystem;
+		if ((fs as any).homeBase) fleetSettings.homeBase = (fs as any).homeBase;
+		if ((fs as any).defaultStorageMode) fleetSettings.defaultStorageMode = (fs as any).defaultStorageMode;
 	});
 
 	let saveSuccess = $state(false);
@@ -285,6 +291,52 @@
 
 		{:else if activeTab === "fleet"}
 			<h2 class="text-lg font-semibold text-star-white mb-4">Fleet Configuration</h2>
+
+			<h3 class="text-md font-semibold text-star-white mb-3">Home Base</h3>
+			<div class="space-y-4 max-w-md">
+				<div>
+					<label class="block text-sm text-chrome-silver mb-1">Home System ID</label>
+					<input
+						type="text"
+						bind:value={fleetSettings.homeSystem}
+						placeholder="Auto-discovered if empty"
+						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none placeholder:text-hull-grey/50"
+					/>
+					<p class="text-xs text-hull-grey mt-1">Star system where your faction base is. Leave empty for auto-discovery.</p>
+				</div>
+				<div>
+					<label class="block text-sm text-chrome-silver mb-1">Home Base ID</label>
+					<input
+						type="text"
+						bind:value={fleetSettings.homeBase}
+						placeholder="Auto-discovered if empty"
+						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none placeholder:text-hull-grey/50"
+					/>
+					<p class="text-xs text-hull-grey mt-1">Station ID for fleet home. Bots return here to sell, deposit, refuel. Set manually or auto-discover from faction.</p>
+				</div>
+				<div>
+					<label class="block text-sm text-chrome-silver mb-1">Default Storage Mode</label>
+					<select
+						bind:value={fleetSettings.defaultStorageMode}
+						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
+					>
+						<option value="sell">Sell (bots sell cargo directly)</option>
+						<option value="deposit">Deposit (store at station)</option>
+						<option value="faction_deposit">Faction Deposit (full supply chain)</option>
+					</select>
+					<p class="text-xs text-hull-grey mt-1">
+						{#if fleetSettings.defaultStorageMode === "faction_deposit"}
+							Bots deposit ore/goods into faction storage. Enables supply chain: miners &rarr; faction &rarr; crafters &rarr; traders.
+						{:else if fleetSettings.defaultStorageMode === "deposit"}
+							Bots deposit cargo into personal station storage for stockpiling.
+						{:else}
+							Bots sell cargo immediately at best price. No supply chain.
+						{/if}
+					</p>
+				</div>
+			</div>
+
+			<h3 class="text-md font-semibold text-star-white mt-6 mb-3">Bot Limits</h3>
 			<div class="space-y-4 max-w-md">
 				<div>
 					<label class="block text-sm text-chrome-silver mb-1">Max Bots</label>
@@ -293,6 +345,7 @@
 						bind:value={fleetSettings.maxBots}
 						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
 					/>
+					<p class="text-xs text-hull-grey mt-1">Maximum bots the fleet can manage simultaneously.</p>
 				</div>
 				<div>
 					<label class="block text-sm text-chrome-silver mb-1">Login Stagger (ms)</label>
@@ -301,14 +354,7 @@
 						bind:value={fleetSettings.loginStagger}
 						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
 					/>
-				</div>
-				<div>
-					<label class="block text-sm text-chrome-silver mb-1">Snapshot Interval (seconds)</label>
-					<input
-						type="number"
-						bind:value={fleetSettings.snapshotInterval}
-						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
-					/>
+					<p class="text-xs text-hull-grey mt-1">Delay between bot logins to avoid rate limiting (5000ms recommended).</p>
 				</div>
 			</div>
 
@@ -323,7 +369,7 @@
 						max="100"
 						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
 					/>
-					<p class="text-xs text-hull-grey mt-1">Percentage of sell profits deposited into faction treasury (0 = disabled)</p>
+					<p class="text-xs text-hull-grey mt-1">% of sell profits auto-deposited into faction treasury. Funds facility upgrades and faction ops. 0 = disabled.</p>
 				</div>
 				<div>
 					<label class="block text-sm text-chrome-silver mb-1">Min Bot Credits</label>
@@ -334,32 +380,38 @@
 						step="1000"
 						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
 					/>
-					<p class="text-xs text-hull-grey mt-1">Bots below this amount withdraw from faction treasury (0 = disabled)</p>
+					<p class="text-xs text-hull-grey mt-1">Bots below this threshold withdraw from faction treasury to top up. 0 = disabled.</p>
 				</div>
 			</div>
 
 		{:else if activeTab === "economy"}
 			<h2 class="text-lg font-semibold text-star-white mb-4">Economy Configuration</h2>
+			<p class="text-sm text-chrome-silver mb-4">Controls how bots trade on the market. These settings affect trader and quartermaster routines.</p>
 			<div class="space-y-4 max-w-md">
 				<div class="flex items-center justify-between">
-					<label class="text-sm text-chrome-silver">Enable Premium Orders</label>
-					<input type="checkbox" bind:checked={economySettings.enablePremiumOrders} class="w-4 h-4 accent-plasma-cyan" />
+					<div>
+						<label class="text-sm text-chrome-silver">Enable Premium Orders</label>
+						<p class="text-xs text-hull-grey mt-0.5">Allow bots to place sell orders above market price for higher profit. Orders take longer to fill.</p>
+					</div>
+					<input type="checkbox" bind:checked={economySettings.enablePremiumOrders} class="w-4 h-4 accent-plasma-cyan shrink-0 ml-4" />
 				</div>
 				<div>
-					<label class="block text-sm text-chrome-silver mb-1">Max Premium %</label>
+					<label class="block text-sm text-chrome-silver mb-1">Max Premium (%)</label>
 					<input
 						type="number"
 						bind:value={economySettings.maxPremiumPct}
 						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
 					/>
+					<p class="text-xs text-hull-grey mt-1">Maximum markup above market price for premium sell orders. Higher = more profit per sale but slower fills. 50% is aggressive.</p>
 				</div>
 				<div>
-					<label class="block text-sm text-chrome-silver mb-1">Min Crafting Margin %</label>
+					<label class="block text-sm text-chrome-silver mb-1">Min Crafting Margin (%)</label>
 					<input
 						type="number"
 						bind:value={economySettings.minCraftingMarginPct}
 						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
 					/>
+					<p class="text-xs text-hull-grey mt-1">Minimum profit margin required for crafters to produce an item. Prevents crafting items that sell at a loss. 30% is conservative.</p>
 				</div>
 				<div>
 					<label class="block text-sm text-chrome-silver mb-1">Batch Sell Size</label>
@@ -368,6 +420,7 @@
 						bind:value={economySettings.batchSellSize}
 						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
 					/>
+					<p class="text-xs text-hull-grey mt-1">Max items per sell order. Larger batches are more efficient but risk price drops on high volume.</p>
 				</div>
 				<div>
 					<label class="block text-sm text-chrome-silver mb-1">Order Stale Timeout (minutes)</label>
@@ -376,6 +429,7 @@
 						bind:value={economySettings.orderStaleTimeout}
 						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
 					/>
+					<p class="text-xs text-hull-grey mt-1">Cancel unfilled orders after this many minutes and relist at current market price. Prevents stale orders from locking up inventory.</p>
 				</div>
 			</div>
 
@@ -425,7 +479,7 @@
 			<div class="space-y-2 text-sm">
 				<div class="flex justify-between">
 					<span class="text-chrome-silver">Commander Version</span>
-					<span class="text-star-white mono">2.0.0</span>
+					<span class="text-star-white mono">3.0.0</span>
 				</div>
 				<div class="flex justify-between">
 					<span class="text-chrome-silver">Runtime</span>
@@ -445,7 +499,7 @@
 				</div>
 			</div>
 			<div class="mt-6 pt-4 border-t border-hull-grey/30">
-				<p class="text-xs text-hull-grey">SpaceMolt Commander v2 - Fleet automation and training data collection</p>
+				<p class="text-xs text-hull-grey">SpaceMolt Commander v3 - Fleet automation with AI commander and training data pipeline</p>
 			</div>
 		{/if}
 	</div>

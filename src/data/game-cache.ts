@@ -152,7 +152,9 @@ export class GameCache {
     const cached = this.getStatic("ship_catalog", this.gameVersion);
     if (cached) {
       const raw = JSON.parse(cached) as Array<Record<string, unknown>>;
-      if (raw.length >= 50) return raw.map(normalizeShipClass);
+      // Re-fetch if cache is missing region field (added later)
+      const hasRegion = raw.length > 0 && "region" in raw[0];
+      if (raw.length >= 50 && hasRegion) return raw.map(normalizeShipClass);
     }
 
     const raw = await this.fetchAllCatalogPages(api, "ships");

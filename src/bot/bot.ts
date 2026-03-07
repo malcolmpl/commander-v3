@@ -398,7 +398,7 @@ export class Bot {
     this._error = null;
 
     try {
-      const result = await this.deps.api.login(password ?? "");
+      const result = await this.deps.api.login(password || undefined);
       this._session = { id: result.sessionId, playerId: result.player.id, createdAt: new Date().toISOString(), expiresAt: "" };
       this._player = result.player;
       this._ship = result.ship;
@@ -477,7 +477,11 @@ export class Bot {
     }
 
     this._routine = routineName;
-    this._lastRoutine = routineName;
+    // Only update lastRoutine for "work" routines (not one-shot routines like refit/scout)
+    const ONE_SHOT = new Set(["refit", "ship_upgrade", "scout", "return_home"]);
+    if (!ONE_SHOT.has(routineName)) {
+      this._lastRoutine = routineName;
+    }
     this._params = params;
     this._routineState = "starting";
     this._shouldStop = false;
@@ -500,6 +504,15 @@ export class Bot {
 
   /** Request graceful stop. The routine will finish at next yield. */
   requestStop(): void {
+    if (this._status === "error") {
+      // Reset error-state bots back to ready (clear stale error message)
+      this._error = null;
+      this._routine = null;
+      this._routineState = "";
+      this._generator = null;
+      this._status = "ready";
+      return;
+    }
     if (this._status !== "running") return;
     this._shouldStop = true;
     this._status = "stopping";

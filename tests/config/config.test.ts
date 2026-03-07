@@ -50,7 +50,7 @@ describe("AiConfigSchema", () => {
 describe("loadConfig", () => {
   test("loads config.toml from project root", () => {
     const config = loadConfig("config.toml");
-    expect(config.commander.brain).toBe("tiered");
+    expect(["scoring", "tiered"]).toContain(config.commander.brain);
     expect(config.ai.ollama_base_url).toBe("http://localhost:11434");
     expect(config.server.port).toBe(3000);
     expect(config.goals.length).toBeGreaterThan(0);

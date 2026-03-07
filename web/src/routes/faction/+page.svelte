@@ -1,8 +1,103 @@
 <script lang="ts">
 	import { factionState, economy } from "$stores/websocket";
 
+	type FactionTab = "overview" | "storage_tx" | "credits_tx";
+	type TxRange = "1h" | "1d" | "1w";
+
+	let activeTab = $state<FactionTab>("overview");
+	let txRange = $state<TxRange>("1d");
+
+	interface FactionTx {
+		timestamp: number;
+		botId: string | null;
+		type: string;
+		itemId: string | null;
+		itemName: string | null;
+		quantity: number | null;
+		credits: number | null;
+		details: string | null;
+	}
+
+	let transactions = $state<FactionTx[]>([]);
+
+	const TX_RANGES: { label: string; value: TxRange }[] = [
+		{ label: "1H", value: "1h" },
+		{ label: "1D", value: "1d" },
+		{ label: "1W", value: "1w" },
+	];
+
+	async function fetchTransactions(r: TxRange) {
+		try {
+			const res = await fetch(`/api/faction/transactions?range=${r}&limit=500`);
+			if (res.ok) transactions = await res.json();
+		} catch { /* silent */ }
+	}
+
+	$effect(() => {
+		if (activeTab === "storage_tx" || activeTab === "credits_tx") fetchTransactions(txRange);
+	});
+	$effect(() => {
+		if (activeTab !== "storage_tx" && activeTab !== "credits_tx") return;
+		const interval = setInterval(() => fetchTransactions(txRange), 15_000);
+		return () => clearInterval(interval);
+	});
+
+	const storageTx = $derived(transactions.filter(t =>
+		t.type === "item_deposit" || t.type === "item_withdraw" || t.type === "sell_order" || t.type === "buy_order"
+	));
+
+	const creditsTx = $derived(transactions.filter(t =>
+		t.type === "credit_deposit" || t.type === "credit_withdraw"
+	));
+
+	const creditsSummary = $derived.by(() => {
+		let deposited = 0, withdrawn = 0;
+		for (const t of creditsTx) {
+			if (t.type === "credit_deposit") deposited += (t.credits ?? 0);
+			else withdrawn += (t.credits ?? 0);
+		}
+		return { deposited, withdrawn, net: deposited - withdrawn };
+	});
+
+	const storageSummary = $derived.by(() => {
+		let depositsCount = 0, withdrawsCount = 0, sellsCount = 0;
+		for (const t of storageTx) {
+			if (t.type === "item_deposit") depositsCount++;
+			else if (t.type === "item_withdraw") withdrawsCount++;
+			else sellsCount++;
+		}
+		return { depositsCount, withdrawsCount, sellsCount };
+	});
+
 	function formatItemName(id: string): string {
 		return id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+	}
+
+	function formatTxTime(ts: number): string {
+		const d = new Date(ts);
+		return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+	}
+
+	function txTypeLabel(type: string): string {
+		switch (type) {
+			case "item_deposit": return "DEPOSIT";
+			case "item_withdraw": return "WITHDRAW";
+			case "sell_order": return "SELL";
+			case "buy_order": return "BUY";
+			case "credit_deposit": return "DEPOSIT";
+			case "credit_withdraw": return "WITHDRAW";
+			default: return type;
+		}
+	}
+
+	function txTypeColor(type: string): string {
+		switch (type) {
+			case "item_deposit": case "credit_deposit": return "bg-bio-green/20 text-bio-green";
+			case "item_withdraw": case "credit_withdraw": return "bg-shell-orange/20 text-shell-orange";
+			case "sell_order": return "bg-plasma-cyan/20 text-plasma-cyan";
+			case "buy_order": return "bg-claw-red/20 text-claw-red";
+			default: return "bg-hull-grey/20 text-hull-grey";
+		}
 	}
 
 	const totalStorageItems = $derived(
@@ -54,15 +149,28 @@
 				<span class="text-chrome-silver text-sm">{$factionState.name}</span>
 			{/if}
 		</div>
-		{#if $factionState?.commanderAware}
-			<span class="text-xs px-2 py-1 rounded bg-bio-green/10 text-bio-green border border-bio-green/30">
-				Commander Aware
-			</span>
-		{:else}
-			<span class="text-xs px-2 py-1 rounded bg-hull-grey/10 text-hull-grey border border-hull-grey/30">
-				Commander Not Using Faction Storage
-			</span>
-		{/if}
+		<div class="flex items-center gap-2">
+			{#if $factionState?.commanderAware}
+				<span class="text-xs px-2 py-1 rounded bg-bio-green/10 text-bio-green border border-bio-green/30">
+					Commander Aware
+				</span>
+			{:else}
+				<span class="text-xs px-2 py-1 rounded bg-hull-grey/10 text-hull-grey border border-hull-grey/30">
+					Commander Not Using Faction Storage
+				</span>
+			{/if}
+			<div class="flex gap-1 bg-deep-void rounded-lg p-0.5">
+				<button class="px-3 py-1 text-xs rounded-md transition-colors {activeTab === 'overview'
+					? 'bg-plasma-cyan/20 text-plasma-cyan' : 'text-hull-grey hover:text-chrome-silver'}"
+					onclick={() => activeTab = "overview"}>Overview</button>
+				<button class="px-3 py-1 text-xs rounded-md transition-colors {activeTab === 'storage_tx'
+					? 'bg-plasma-cyan/20 text-plasma-cyan' : 'text-hull-grey hover:text-chrome-silver'}"
+					onclick={() => activeTab = "storage_tx"}>Storage Log</button>
+				<button class="px-3 py-1 text-xs rounded-md transition-colors {activeTab === 'credits_tx'
+					? 'bg-plasma-cyan/20 text-plasma-cyan' : 'text-hull-grey hover:text-chrome-silver'}"
+					onclick={() => activeTab = "credits_tx"}>Credits Log</button>
+			</div>
+		</div>
 	</div>
 
 	{#if !$factionState?.id}
@@ -110,6 +218,7 @@
 			</div>
 		</div>
 
+		{#if activeTab === "overview"}
 		<div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
 			<!-- Storage (2/3 width) -->
 			<div class="lg:col-span-2 card p-4">
@@ -231,6 +340,132 @@
 			</div>
 		</div>
 
+		<!-- Faction Orders -->
+		<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+			<!-- Buy Orders -->
+			<div class="card p-4">
+				<h2 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-3">
+					Faction Buy Orders
+					{#if ($factionState.orders ?? []).filter(o => o.type === "buy").length > 0}
+						<span class="text-hull-grey font-normal ml-1">({($factionState.orders ?? []).filter(o => o.type === "buy").length})</span>
+					{/if}
+				</h2>
+				{#if ($factionState.orders ?? []).filter(o => o.type === "buy").length === 0}
+					<p class="text-sm text-hull-grey py-4 text-center">No active faction buy orders</p>
+				{:else}
+					<div class="space-y-1">
+						{#each ($factionState.orders ?? []).filter(o => o.type === "buy") as order}
+							<div class="flex items-center justify-between py-1.5 px-2 rounded bg-deep-void/50">
+								<div>
+									<span class="text-sm text-star-white">{order.itemName}</span>
+									<span class="text-xs text-hull-grey ml-2">@ {order.stationName}</span>
+								</div>
+								<div class="text-right text-xs">
+									<span class="mono text-bio-green">{order.priceEach.toLocaleString()} cr</span>
+									<span class="text-hull-grey ml-1">x{order.quantity}</span>
+								</div>
+							</div>
+						{/each}
+					</div>
+				{/if}
+			</div>
+
+			<!-- Sell Orders -->
+			<div class="card p-4">
+				<h2 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-3">
+					Faction Sell Orders
+					{#if ($factionState.orders ?? []).filter(o => o.type === "sell").length > 0}
+						<span class="text-hull-grey font-normal ml-1">({($factionState.orders ?? []).filter(o => o.type === "sell").length})</span>
+					{/if}
+				</h2>
+				{#if ($factionState.orders ?? []).filter(o => o.type === "sell").length === 0}
+					<p class="text-sm text-hull-grey py-4 text-center">No active faction sell orders</p>
+				{:else}
+					<div class="space-y-1">
+						{#each ($factionState.orders ?? []).filter(o => o.type === "sell") as order}
+							<div class="flex items-center justify-between py-1.5 px-2 rounded bg-deep-void/50">
+								<div>
+									<span class="text-sm text-star-white">{order.itemName}</span>
+									<span class="text-xs text-hull-grey ml-2">@ {order.stationName}</span>
+								</div>
+								<div class="text-right text-xs">
+									<span class="mono text-shell-orange">{order.priceEach.toLocaleString()} cr</span>
+									<span class="text-hull-grey ml-1">x{order.quantity}</span>
+									{#if order.filled > 0}
+										<span class="text-bio-green ml-1">({order.filled} filled)</span>
+									{/if}
+								</div>
+							</div>
+						{/each}
+					</div>
+				{/if}
+			</div>
+		</div>
+
+		<!-- Faction Missions -->
+		<div class="card p-4">
+			<h2 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-3">
+				Faction Missions
+				{#if ($factionState.missions ?? []).length > 0}
+					<span class="text-hull-grey font-normal ml-1">({($factionState.missions ?? []).length})</span>
+				{/if}
+			</h2>
+			{#if ($factionState.missions ?? []).length === 0}
+				<p class="text-sm text-hull-grey py-4 text-center">No active faction missions</p>
+			{:else}
+				<div class="space-y-2">
+					{#each $factionState.missions ?? [] as mission}
+						<div class="py-2 px-3 rounded bg-deep-void/50 border border-hull-grey/10">
+							<div class="flex items-center justify-between">
+								<span class="text-sm text-star-white font-medium">{mission.title}</span>
+								<div class="flex items-center gap-2">
+									<span class="text-[10px] uppercase px-1.5 py-0.5 rounded
+										{mission.type === 'delivery' ? 'bg-plasma-cyan/20 text-plasma-cyan' :
+										 mission.type === 'combat' ? 'bg-claw-red/20 text-claw-red' :
+										 'bg-hull-grey/20 text-hull-grey'}">{mission.type}</span>
+									<span class="text-[10px] uppercase px-1.5 py-0.5 rounded
+										{mission.status === 'active' ? 'bg-bio-green/20 text-bio-green' :
+										 mission.status === 'completed' ? 'bg-warning-yellow/20 text-warning-yellow' :
+										 'bg-hull-grey/20 text-hull-grey'}">{mission.status}</span>
+								</div>
+							</div>
+							{#if mission.description}
+								<p class="text-xs text-hull-grey mt-1">{mission.description}</p>
+							{/if}
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</div>
+
+		<!-- Intel Coverage -->
+		{#if $factionState.intelCoverage || $factionState.tradeIntelCoverage}
+		<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+			{#if $factionState.intelCoverage}
+				<div class="card p-4">
+					<h2 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-2">System Intel Coverage</h2>
+					<div class="flex items-center gap-3">
+						<div class="flex-1 h-2 bg-hull-grey/20 rounded-full overflow-hidden">
+							<div class="h-full bg-plasma-cyan rounded-full" style="width:{Math.round($factionState.intelCoverage.systemsSubmitted / Math.max(1, $factionState.intelCoverage.totalSystems) * 100)}%"></div>
+						</div>
+						<span class="mono text-xs text-chrome-silver">{$factionState.intelCoverage.systemsSubmitted}/{$factionState.intelCoverage.totalSystems}</span>
+					</div>
+				</div>
+			{/if}
+			{#if $factionState.tradeIntelCoverage}
+				<div class="card p-4">
+					<h2 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-2">Trade Intel Coverage</h2>
+					<div class="flex items-center gap-3">
+						<div class="flex-1 h-2 bg-hull-grey/20 rounded-full overflow-hidden">
+							<div class="h-full bg-bio-green rounded-full" style="width:{Math.round($factionState.tradeIntelCoverage.stationsSubmitted / Math.max(1, $factionState.tradeIntelCoverage.totalStations) * 100)}%"></div>
+						</div>
+						<span class="mono text-xs text-chrome-silver">{$factionState.tradeIntelCoverage.stationsSubmitted}/{$factionState.tradeIntelCoverage.totalStations}</span>
+					</div>
+				</div>
+			{/if}
+		</div>
+		{/if}
+
 		<!-- Commander Integration Info -->
 		<div class="card p-4">
 			<h2 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider mb-3">
@@ -279,5 +514,144 @@
 				</div>
 			</div>
 		</div>
+
+		{:else if activeTab === "storage_tx"}
+		<!-- STORAGE TRANSACTIONS TAB -->
+		<div class="card p-4">
+			<div class="flex items-center justify-between mb-3">
+				<div>
+					<h2 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider">
+						Faction Storage Transactions
+					</h2>
+					{#if storageTx.length > 0}
+						<p class="text-xs text-hull-grey mt-0.5">
+							{storageSummary.depositsCount} deposits &middot;
+							{storageSummary.withdrawsCount} withdrawals &middot;
+							{storageSummary.sellsCount} sells
+						</p>
+					{/if}
+				</div>
+				<div class="flex gap-1">
+					{#each TX_RANGES as r}
+						<button
+							class="px-2 py-0.5 text-xs rounded transition-colors {txRange === r.value
+								? 'bg-plasma-cyan/20 text-plasma-cyan'
+								: 'text-hull-grey hover:text-chrome-silver'}"
+							onclick={() => txRange = r.value}
+						>{r.label}</button>
+					{/each}
+				</div>
+			</div>
+
+			{#if storageTx.length === 0}
+				<p class="text-sm text-hull-grey py-8 text-center">No storage transactions recorded</p>
+			{:else}
+				<div class="overflow-x-auto max-h-[500px] overflow-y-auto">
+					<table class="w-full text-xs">
+						<thead class="sticky top-0 bg-deep-void">
+							<tr class="text-left text-[10px] text-chrome-silver uppercase tracking-wider border-b border-hull-grey/30">
+								<th class="pb-1.5 pr-3">Time</th>
+								<th class="pb-1.5 pr-3">Bot</th>
+								<th class="pb-1.5 pr-3">Action</th>
+								<th class="pb-1.5 pr-3">Item</th>
+								<th class="pb-1.5 pr-3 text-right">Qty</th>
+								<th class="pb-1.5 text-right">Value</th>
+							</tr>
+						</thead>
+						<tbody class="divide-y divide-hull-grey/10">
+							{#each storageTx as tx}
+								<tr class="hover:bg-nebula-blue/10 transition-colors">
+									<td class="py-1.5 pr-3 text-hull-grey mono whitespace-nowrap">{formatTxTime(tx.timestamp)}</td>
+									<td class="py-1.5 pr-3 text-laser-blue truncate max-w-[80px]">{tx.botId ?? "—"}</td>
+									<td class="py-1.5 pr-3">
+										<span class="font-medium px-1.5 py-0.5 rounded text-[10px] {txTypeColor(tx.type)}">
+											{txTypeLabel(tx.type)}
+										</span>
+									</td>
+									<td class="py-1.5 pr-3 text-star-white">{tx.itemName ?? formatItemName(tx.itemId ?? "")}</td>
+									<td class="py-1.5 pr-3 text-right mono text-chrome-silver">{tx.quantity ?? "—"}</td>
+									<td class="py-1.5 text-right mono {tx.credits && tx.credits > 0 ? 'text-bio-green' : 'text-hull-grey'}">
+										{tx.credits ? `${tx.credits.toLocaleString()} cr` : "—"}
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{/if}
+		</div>
+
+		{:else if activeTab === "credits_tx"}
+		<!-- CREDITS TRANSACTIONS TAB -->
+		<div class="grid grid-cols-3 gap-3 mb-4">
+			<div class="card p-3">
+				<p class="text-[10px] text-chrome-silver uppercase tracking-wider">Deposited</p>
+				<p class="text-xl font-bold mono text-bio-green mt-0.5">{creditsSummary.deposited.toLocaleString()}</p>
+			</div>
+			<div class="card p-3">
+				<p class="text-[10px] text-chrome-silver uppercase tracking-wider">Withdrawn</p>
+				<p class="text-xl font-bold mono text-shell-orange mt-0.5">{creditsSummary.withdrawn.toLocaleString()}</p>
+			</div>
+			<div class="card p-3">
+				<p class="text-[10px] text-chrome-silver uppercase tracking-wider">Net Flow</p>
+				<p class="text-xl font-bold mono mt-0.5 {creditsSummary.net >= 0 ? 'text-bio-green' : 'text-claw-red'}">
+					{creditsSummary.net >= 0 ? "+" : ""}{creditsSummary.net.toLocaleString()}
+				</p>
+			</div>
+		</div>
+
+		<div class="card p-4">
+			<div class="flex items-center justify-between mb-3">
+				<h2 class="text-sm font-semibold text-chrome-silver uppercase tracking-wider">
+					Faction Credit Transactions
+				</h2>
+				<div class="flex gap-1">
+					{#each TX_RANGES as r}
+						<button
+							class="px-2 py-0.5 text-xs rounded transition-colors {txRange === r.value
+								? 'bg-plasma-cyan/20 text-plasma-cyan'
+								: 'text-hull-grey hover:text-chrome-silver'}"
+							onclick={() => txRange = r.value}
+						>{r.label}</button>
+					{/each}
+				</div>
+			</div>
+
+			{#if creditsTx.length === 0}
+				<p class="text-sm text-hull-grey py-8 text-center">No credit transactions recorded</p>
+			{:else}
+				<div class="overflow-x-auto max-h-[500px] overflow-y-auto">
+					<table class="w-full text-xs">
+						<thead class="sticky top-0 bg-deep-void">
+							<tr class="text-left text-[10px] text-chrome-silver uppercase tracking-wider border-b border-hull-grey/30">
+								<th class="pb-1.5 pr-3">Time</th>
+								<th class="pb-1.5 pr-3">Bot</th>
+								<th class="pb-1.5 pr-3">Action</th>
+								<th class="pb-1.5 pr-3 text-right">Amount</th>
+								<th class="pb-1.5">Details</th>
+							</tr>
+						</thead>
+						<tbody class="divide-y divide-hull-grey/10">
+							{#each creditsTx as tx}
+								<tr class="hover:bg-nebula-blue/10 transition-colors">
+									<td class="py-1.5 pr-3 text-hull-grey mono whitespace-nowrap">{formatTxTime(tx.timestamp)}</td>
+									<td class="py-1.5 pr-3 text-laser-blue truncate max-w-[80px]">{tx.botId ?? "—"}</td>
+									<td class="py-1.5 pr-3">
+										<span class="font-medium px-1.5 py-0.5 rounded text-[10px] {txTypeColor(tx.type)}">
+											{txTypeLabel(tx.type)}
+										</span>
+									</td>
+									<td class="py-1.5 pr-3 text-right mono font-medium {tx.type === 'credit_deposit' ? 'text-bio-green' : 'text-shell-orange'}">
+										{tx.type === 'credit_deposit' ? '+' : '-'}{(tx.credits ?? 0).toLocaleString()} cr
+									</td>
+									<td class="py-1.5 text-hull-grey text-[11px]">{tx.details ?? "—"}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{/if}
+		</div>
+		{/if}
 	{/if}
 </div>

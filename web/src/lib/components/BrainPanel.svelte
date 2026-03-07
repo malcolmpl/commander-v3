@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { commanderLog, brainHealth } from "$stores/websocket";
+	import { commanderLog, brainHealth, brainDecisionStats } from "$stores/websocket";
 
 	const latest = $derived($commanderLog[0] ?? null);
 	const brainName = $derived(latest?.brainName ?? "—");
@@ -30,6 +30,11 @@
 		if (ms < 1000) return `${ms}ms`;
 		return `${(ms / 1000).toFixed(1)}s`;
 	}
+
+	// Brain decision breakdown
+	const stats = $derived($brainDecisionStats);
+	const totalDecisions = $derived(stats?.total ?? 0);
+	const brainBreakdown = $derived(stats?.byBrain ?? []);
 </script>
 
 <div class="card p-4 space-y-3">
@@ -78,6 +83,48 @@
 		{/if}
 	{:else}
 		<p class="text-xs text-hull-grey">No decisions yet.</p>
+	{/if}
+
+	<!-- Decision Breakdown (LLM vs Scoring) -->
+	{#if totalDecisions > 0 && brainBreakdown.length > 0}
+		<div class="pt-2 border-t border-hull-grey/30 space-y-2">
+			<span class="text-[10px] text-hull-grey uppercase tracking-wider">Decision Breakdown</span>
+			<div class="text-[10px] text-hull-grey mb-1">{totalDecisions} total decisions</div>
+			{#each brainBreakdown as brain}
+				{@const pct = totalDecisions > 0 ? (brain.count / totalDecisions * 100) : 0}
+				<div class="space-y-0.5">
+					<div class="flex items-center justify-between text-xs">
+						<span class="text-chrome-silver truncate">{brain.brainName}</span>
+						<span class="mono text-hull-grey">{brain.count} ({pct.toFixed(0)}%)</span>
+					</div>
+					<div class="w-full h-1 bg-deep-void rounded-full overflow-hidden">
+						<div class="h-full rounded-full transition-all duration-500 {brain.brainName.includes('scoring') ? 'bg-shell-orange' : 'bg-plasma-cyan'}"
+							style="width: {pct}%"></div>
+					</div>
+					<div class="flex gap-3 text-[9px] text-hull-grey">
+						<span>avg {formatLatency(brain.avgLatency)}</span>
+						<span>conf {(brain.avgConfidence * 100).toFixed(0)}%</span>
+					</div>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
+	<!-- Shadow Mode Stats -->
+	{#if stats?.shadowStats}
+		<div class="pt-2 border-t border-hull-grey/30">
+			<span class="text-[10px] text-hull-grey uppercase tracking-wider">Shadow Mode</span>
+			<div class="flex items-center justify-between mt-1">
+				<span class="text-xs text-chrome-silver">Agreement Rate</span>
+				<span class="text-xs mono {stats.shadowStats.avgAgreementRate >= 0.8 ? 'text-bio-green' : stats.shadowStats.avgAgreementRate >= 0.5 ? 'text-warning-yellow' : 'text-claw-red'}">
+					{(stats.shadowStats.avgAgreementRate * 100).toFixed(0)}%
+				</span>
+			</div>
+			<div class="flex items-center justify-between mt-0.5">
+				<span class="text-xs text-chrome-silver">Comparisons</span>
+				<span class="text-xs mono text-hull-grey">{stats.shadowStats.totalComparisons}</span>
+			</div>
+		</div>
 	{/if}
 
 	<!-- Per-Brain Health -->

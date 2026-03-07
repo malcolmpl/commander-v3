@@ -252,6 +252,41 @@ function ensureTables(sqlite: Database): void {
       updated_at TEXT DEFAULT (datetime('now'))
     )`);
     sqlite.run("CREATE INDEX IF NOT EXISTS idx_poi_system ON poi_cache(system_id)");
+
+    // Faction transactions
+    sqlite.run(`CREATE TABLE IF NOT EXISTS faction_transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp INTEGER NOT NULL,
+      bot_id TEXT,
+      type TEXT NOT NULL,
+      item_id TEXT,
+      item_name TEXT,
+      quantity INTEGER,
+      credits REAL,
+      details TEXT
+    )`);
+    sqlite.run("CREATE INDEX IF NOT EXISTS idx_faction_tx_ts ON faction_transactions(timestamp)");
+    sqlite.run("CREATE INDEX IF NOT EXISTS idx_faction_tx_type ON faction_transactions(type)");
+
+    // Activity log (bot state changes)
+    sqlite.run(`CREATE TABLE IF NOT EXISTS activity_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp INTEGER NOT NULL,
+      level TEXT NOT NULL DEFAULT 'info',
+      bot_id TEXT,
+      message TEXT NOT NULL,
+      details TEXT
+    )`);
+    sqlite.run("CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_log(timestamp)");
+    sqlite.run("CREATE INDEX IF NOT EXISTS idx_activity_bot ON activity_log(bot_id)");
+
+    // Commander memory (persistent knowledge base)
+    sqlite.run(`CREATE TABLE IF NOT EXISTS commander_memory (
+      key TEXT PRIMARY KEY,
+      fact TEXT NOT NULL,
+      importance INTEGER NOT NULL DEFAULT 5,
+      updated_at TEXT DEFAULT (datetime('now'))
+    )`);
   });
 
   tx();

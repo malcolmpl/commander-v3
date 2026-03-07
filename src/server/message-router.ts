@@ -10,6 +10,7 @@ import type { BotManager } from "../bot/bot-manager";
 import type { Commander } from "../commander/commander";
 import type { Galaxy } from "../core/galaxy";
 import type { DB } from "../data/db";
+import type { GameCache } from "../data/game-cache";
 import { broadcast, sendTo } from "./server";
 import { saveBotSettings, saveFleetSettings, saveGoals } from "../fleet/persistence";
 
@@ -18,7 +19,9 @@ export interface MessageRouterDeps {
   commander: Commander;
   galaxy: Galaxy;
   db: DB;
+  cache: GameCache;
   ensureGalaxyLoaded: () => Promise<void>;
+  runDiscovery: () => Promise<void>;
 }
 
 interface WsData {
@@ -83,12 +86,16 @@ export function handleClientMessage(
       }
 
       case "set_inventory_target": {
-        commander.setStockTargets([...(commander as any).stockTargets ?? [], msg.target]);
+        const eco = commander.getEconomy();
+        eco.addStockTarget(msg.target);
+        broadcast({ type: "notification", level: "info", title: "Target set", message: `${msg.target.item_id} @ ${msg.target.station_id}` });
         break;
       }
 
       case "remove_inventory_target": {
-        // Remove target by station+item match
+        const eco2 = commander.getEconomy();
+        eco2.removeStockTarget(msg.stationId, msg.itemId);
+        broadcast({ type: "notification", level: "info", title: "Target removed", message: `${msg.itemId} @ ${msg.stationId}` });
         break;
       }
 
@@ -101,9 +108,34 @@ export function handleClientMessage(
 
             await bot.login();
             await deps.ensureGalaxyLoaded();
+            // Trigger home discovery if not yet found
+            if (!botManager.fleetConfig.homeBase) {
+              await deps.runDiscovery();
+            }
             await commander.forceEvaluation();
           } catch (err) {
             broadcast({ type: "notification", level: "warning", title: "Start failed", message: err instanceof Error ? err.message : String(err) });
+          }
+        })();
+        break;
+      }
+
+      case "start_all_bots": {
+        (async () => {
+          try {
+            const result = await botManager.loginAll();
+            if (result.success.length > 0) {
+              await deps.ensureGalaxyLoaded();
+              // Trigger home discovery now that bots have player data
+              await deps.runDiscovery();
+              await commander.forceEvaluation();
+              broadcast({ type: "notification", level: "info", title: "Fleet started", message: `${result.success.length} bot(s) online` });
+            }
+            for (const fail of result.failed) {
+              broadcast({ type: "notification", level: "warning", title: `Login failed: ${fail.username}`, message: fail.error });
+            }
+          } catch (err) {
+            broadcast({ type: "notification", level: "warning", title: "Start all failed", message: err instanceof Error ? err.message : String(err) });
           }
         })();
         break;
@@ -141,6 +173,18 @@ export function handleClientMessage(
         if (settings.minBotCredits !== undefined) {
           botManager.fleetConfig.minBotCredits = Number(settings.minBotCredits);
         }
+        if (settings.homeSystem !== undefined) {
+          botManager.fleetConfig.homeSystem = String(settings.homeSystem);
+        }
+        if (settings.homeBase !== undefined) {
+          botManager.fleetConfig.homeBase = String(settings.homeBase);
+        }
+        if (settings.defaultStorageMode !== undefined) {
+          const mode = String(settings.defaultStorageMode);
+          if (mode === "sell" || mode === "deposit" || mode === "faction_deposit") {
+            botManager.fleetConfig.defaultStorageMode = mode;
+          }
+        }
         saveFleetSettings(db, {
           factionTaxPercent: botManager.fleetConfig.factionTaxPercent,
           minBotCredits: botManager.fleetConfig.minBotCredits,
@@ -150,6 +194,9 @@ export function handleClientMessage(
           settings: {
             factionTaxPercent: botManager.fleetConfig.factionTaxPercent,
             minBotCredits: botManager.fleetConfig.minBotCredits,
+            homeSystem: botManager.fleetConfig.homeSystem,
+            homeBase: botManager.fleetConfig.homeBase,
+            defaultStorageMode: botManager.fleetConfig.defaultStorageMode,
           },
         });
         break;
@@ -193,14 +240,7 @@ export function handleClientMessage(
           const decision = await commander.forceEvaluation();
           broadcast({
             type: "commander_decision",
-            decision: {
-              tick: decision.tick,
-              goal: decision.goal,
-              assignments: decision.assignments,
-              reasoning: decision.reasoning,
-              thoughts: [],
-              timestamp: decision.timestamp,
-            },
+            decision,
           });
         })();
         break;
@@ -229,6 +269,70 @@ export function handleClientMessage(
               botId: msg.botId,
               storage: { stations: [], totalItems: 0, totalCredits: 0 },
             });
+          }
+        })();
+        break;
+      }
+
+      case "request_galaxy": {
+        (async () => {
+          if (galaxy.systemCount < 50) {
+            await deps.ensureGalaxyLoaded();
+          }
+          sendTo(ws, { type: "galaxy_update", systems: galaxy.toSummaries() });
+        })();
+        break;
+      }
+
+      case "request_galaxy_detail": {
+        // Returns galaxy systems enriched with market freshness and shipyard data
+        (async () => {
+          try {
+            // Ensure galaxy is fully loaded before responding
+            if (galaxy.systemCount < 50) {
+              await deps.ensureGalaxyLoaded();
+            }
+            const systems = galaxy.toSummaries();
+            const marketFreshness = deps.cache.getAllMarketFreshness();
+            const freshnessMap = new Map(marketFreshness.map(f => [f.stationId, { fetchedAt: f.fetchedAt, ageMs: f.ageMs, fresh: f.fresh }]));
+
+            // Build market/shipyard data per base
+            const baseMarket: Record<string, { prices: Array<{ itemId: string; itemName: string; buyPrice: number; sellPrice: number; buyVolume: number; sellVolume: number }>; freshness: { fetchedAt: number; ageMs: number; fresh: boolean } }> = {};
+            for (const f of marketFreshness) {
+              const prices = deps.cache.getMarketPrices(f.stationId);
+              if (prices) {
+                baseMarket[f.stationId] = {
+                  prices: prices.map(p => ({ itemId: p.itemId, itemName: p.itemName, buyPrice: p.buyPrice ?? 0, sellPrice: p.sellPrice ?? 0, buyVolume: p.buyVolume, sellVolume: p.sellVolume })),
+                  freshness: { fetchedAt: f.fetchedAt, ageMs: f.ageMs, fresh: f.fresh },
+                };
+              }
+            }
+
+            sendTo(ws, { type: "galaxy_detail", systems, baseMarket });
+          } catch {
+            sendTo(ws, { type: "galaxy_detail", systems: [], baseMarket: {} });
+          }
+        })();
+        break;
+      }
+
+      case "request_catalog": {
+        (async () => {
+          try {
+            const api = botManager.getAllBots().find(b => b.api)?.api;
+            if (!api) {
+              sendTo(ws, { type: "catalog_data", ships: [], items: [], skills: [], recipes: [] });
+              return;
+            }
+            const [ships, items, skills, recipes] = await Promise.all([
+              deps.cache.getShipCatalog(api),
+              deps.cache.getItemCatalog(api),
+              deps.cache.getSkillTree(api),
+              deps.cache.getRecipes(api),
+            ]);
+            sendTo(ws, { type: "catalog_data", ships, items, skills, recipes });
+          } catch (err) {
+            sendTo(ws, { type: "catalog_data", ships: [], items: [], skills: [], recipes: [] });
           }
         })();
         break;

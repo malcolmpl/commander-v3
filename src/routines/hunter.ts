@@ -33,9 +33,10 @@ import {
   interruptibleSleep,
 } from "./helpers";
 
-// Weapon module patterns — hunter must have at least one
+// Weapon module patterns — hunter must have at least one actual combat weapon
+// Note: "weapon_" prefix distinguishes weapon_laser from mining_laser
 const WEAPON_PATTERNS = [
-  "weapon", "laser", "cannon", "turret", "missile", "gun", "blaster", "railgun",
+  "weapon_", "cannon", "turret", "missile", "gun", "blaster", "railgun",
 ];
 
 /** Estimate combat power from ship stats (hull + shield + armor) */
@@ -418,7 +419,7 @@ async function* battleLoop(
 // Wreck Looting
 // ════════════════════════════════════════════════════════════════════
 
-/** Loot any nearby wrecks (max 5 per scan to avoid spam) */
+/** Loot any nearby wrecks (max 5 wrecks per scan to avoid spam) */
 async function* lootNearbyWrecks(
   ctx: BotContext,
   attemptedWrecks?: Set<string>,
@@ -427,12 +428,12 @@ async function* lootNearbyWrecks(
     const wrecks = await ctx.api.getWrecks();
     if (wrecks.length === 0) return;
 
-    let looted = 0;
-    const MAX_LOOT_ATTEMPTS = 5;
+    let wrecksLooted = 0;
+    const MAX_WRECK_ATTEMPTS = 5;
 
     for (const wreck of wrecks) {
       if (ctx.shouldStop) break;
-      if (looted >= MAX_LOOT_ATTEMPTS) break;
+      if (wrecksLooted >= MAX_WRECK_ATTEMPTS) break;
       if (!ctx.cargo.hasSpace(ctx.ship, 1)) {
         yield "cargo full, can't loot more";
         break;
@@ -450,22 +451,25 @@ async function* lootNearbyWrecks(
       if (items.length === 0) continue;
 
       try {
+        let lootedItems = 0;
         for (const item of items) {
           if (!ctx.cargo.hasSpace(ctx.ship, 1)) break;
           await ctx.api.lootWreck(wreckId, item.item_id, item.quantity);
           await ctx.refreshState();
           yield `looted ${item.quantity} ${item.item_id} from wreck`;
-          looted++;
+          lootedItems++;
         }
+        if (lootedItems > 0) wrecksLooted++;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("no_items") && !msg.includes("empty") && !msg.includes("not_found")) {
           yield `loot failed: ${msg}`;
         }
+        wrecksLooted++; // Count failed attempts too to avoid infinite loops
       }
     }
 
-    if (looted === 0 && wrecks.length > 0) {
+    if (wrecksLooted === 0 && wrecks.length > 0) {
       yield `${wrecks.length} wreck(s) nearby — none lootable`;
     }
   } catch (err) {

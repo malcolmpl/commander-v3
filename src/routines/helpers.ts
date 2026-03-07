@@ -354,14 +354,34 @@ export async function burnFuelCells(ctx: BotContext): Promise<boolean> {
 
 /**
  * Repair at the current station if hull is damaged. Must be docked.
+ * Also repairs any worn modules (durability < 100%).
  */
 export async function repairIfNeeded(ctx: BotContext, threshold = 80): Promise<boolean> {
+  let repaired = false;
   const hullPct = (ctx.ship.hull / ctx.ship.maxHull) * 100;
-  if (hullPct >= threshold) return false;
+  if (hullPct < threshold) {
+    await ctx.api.repair();
+    await ctx.refreshState();
+    repaired = true;
+  }
 
-  await ctx.api.repair();
-  await ctx.refreshState();
-  return true;
+  // Repair worn modules while docked
+  if (ctx.player.dockedAtBase) {
+    // Refresh state to get accurate module durability before checking
+    if (repaired) await ctx.refreshState();
+    for (const mod of ctx.ship.modules) {
+      const durability = (mod as any).durability ?? (mod as any).health ?? 100;
+      if (durability < 90) {
+        try {
+          await ctx.api.repairModule(mod.moduleId);
+          repaired = true;
+        } catch { /* module may not be repairable or insufficient credits */ }
+      }
+    }
+    if (repaired) await ctx.refreshState();
+  }
+
+  return repaired;
 }
 
 /**
@@ -491,6 +511,15 @@ export async function sellItem(ctx: BotContext, itemId: string): Promise<TradeRe
 
   const result = await ctx.api.sell(itemId, qty);
   await ctx.refreshState();
+
+  // Emit trade event for logging/tracking
+  if (result.total > 0) {
+    ctx.eventBus.emit({
+      type: "trade_sell", botId: ctx.botId, itemId, quantity: result.quantity,
+      priceEach: result.priceEach, total: result.total,
+      stationId: ctx.player.dockedAtBase ?? "",
+    });
+  }
   return result;
 }
 
@@ -520,6 +549,14 @@ export async function sellAllCargo(ctx: BotContext): Promise<SellResult> {
       totalEarned += result.total;
       items.push({ itemId: item.itemId, quantity: result.quantity, priceEach: result.priceEach, total: result.total });
       log(ctx, `sold ${result.quantity}x ${item.itemId} @ ${result.priceEach}cr = ${result.total}cr`);
+      // Emit trade event for logging/tracking
+      if (result.total > 0) {
+        ctx.eventBus.emit({
+          type: "trade_sell", botId: ctx.botId, itemId: item.itemId, quantity: result.quantity,
+          priceEach: result.priceEach, total: result.total,
+          stationId: ctx.player.dockedAtBase ?? "",
+        });
+      }
       // Record successful sell as demand signal for arbitrage discovery
       if (ctx.player.dockedAtBase && result.priceEach > 0) {
         recordSellResult(ctx, ctx.player.dockedAtBase, item.itemId, item.itemId, result.priceEach, result.quantity);
@@ -553,6 +590,10 @@ export async function depositItem(ctx: BotContext, itemId: string): Promise<void
 
   if (useFaction) {
     await ctx.api.factionDepositItems(itemId, qty);
+    ctx.eventBus.emit({
+      type: "deposit", botId: ctx.botId, itemId, quantity: qty,
+      target: "faction", stationId: ctx.player.dockedAtBase ?? "",
+    });
   } else {
     await ctx.api.depositItems(itemId, qty);
   }
@@ -580,6 +621,10 @@ export async function disposeCargo(ctx: BotContext): Promise<SellResult> {
       try {
         if (mode === "faction_deposit") {
           await ctx.api.factionDepositItems(item.itemId, qty);
+          ctx.eventBus.emit({
+            type: "deposit", botId: ctx.botId, itemId: item.itemId, quantity: qty,
+            target: "faction", stationId: ctx.player.dockedAtBase ?? "",
+          });
         } else {
           await ctx.api.depositItems(item.itemId, qty);
         }
@@ -592,11 +637,14 @@ export async function disposeCargo(ctx: BotContext): Promise<SellResult> {
         break;
       }
     }
-    // If deposit failed, sell remaining cargo so bots don't get stuck
-    if (depositFailed && ctx.ship.cargo.length > 0) {
-      logWarn(ctx, "falling back to selling remaining cargo");
-      const sellResult = await sellAllCargo(ctx);
-      return { totalEarned: sellResult.totalEarned, items: [...items, ...sellResult.items] };
+    // If deposit failed, sell only the REMAINING cargo (not already-deposited items)
+    if (depositFailed) {
+      await ctx.refreshState(); // Get accurate cargo after partial deposits
+      if (ctx.ship.cargo.length > 0) {
+        logWarn(ctx, "falling back to selling remaining cargo");
+        const sellResult = await sellAllCargo(ctx);
+        return { totalEarned: sellResult.totalEarned, items: [...items, ...sellResult.items] };
+      }
     }
     return { totalEarned: 0, items };
   }
@@ -829,6 +877,20 @@ export function cacheMarketData(ctx: BotContext, stationId: string, orders: Mark
   }
 
   ctx.cache.setMarketPrices(stationId, prices, Math.floor(Date.now() / 1000));
+
+  // Submit to faction shared trade intel (best-effort, non-blocking)
+  if (ctx.player.factionId) {
+    ctx.api.factionSubmitTradeIntel([{
+      base_id: stationId,
+      prices: prices.map(p => ({
+        item_id: p.itemId,
+        buy_price: p.buyPrice,
+        sell_price: p.sellPrice,
+        buy_volume: p.buyVolume,
+        sell_volume: p.sellVolume,
+      })),
+    }]).catch(() => { /* non-critical — faction intel submission failed */ });
+  }
 }
 
 /**
@@ -1077,6 +1139,8 @@ export async function payFactionTax(ctx: BotContext, earned: number): Promise<{ 
   try {
     await ctx.api.factionDepositCredits(taxAmount);
     await ctx.refreshState();
+    // Log to faction transactions via logger (if available)
+    ctx.logger.logFactionCreditTx?.("credit_deposit", ctx.botId, taxAmount, `tax ${pct}%`);
     return { deposited: taxAmount, message: `faction tax: deposited ${taxAmount}cr (${pct}%)` };
   } catch (err) {
     log(ctx, `faction tax failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1100,6 +1164,7 @@ export async function ensureMinCredits(ctx: BotContext): Promise<{ withdrawn: nu
   try {
     await ctx.api.factionWithdrawCredits(deficit);
     await ctx.refreshState();
+    ctx.logger.logFactionCreditTx?.("credit_withdraw", ctx.botId, deficit, `min credits top-up`);
     ctx.recordFactionWithdrawal(deficit); // Exclude from revenue tracking
     return { withdrawn: deficit, message: `withdrew ${deficit}cr from faction treasury (credits were below ${minCredits}cr minimum)` };
   } catch (err) {

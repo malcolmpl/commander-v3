@@ -291,7 +291,7 @@
 	</div><!-- end main column -->
 
 	<!-- AI Brain sidebar -->
-	<div class="hidden lg:block space-y-4">
+	<div class="space-y-4">
 		<BrainPanel />
 	</div>
 	</div><!-- end grid -->

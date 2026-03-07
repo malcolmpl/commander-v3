@@ -22,13 +22,12 @@
 
 	const pages: PaletteItem[] = [
 		{ id: "p-fleet", label: "Fleet Overview", category: "page", description: "Dashboard home", action: () => goto("/") },
+		{ id: "p-bots", label: "Bot Management", category: "page", description: "Fleet bots list", action: () => goto("/bots") },
 		{ id: "p-commander", label: "Commander Log", category: "page", description: "AI decisions and orders", action: () => goto("/commander") },
+		{ id: "p-social", label: "Social", category: "page", description: "LLM thoughts, memory, stuck bots", action: () => goto("/social") },
 		{ id: "p-economy", label: "Economy", category: "page", description: "Revenue, costs, supply chain", action: () => goto("/economy") },
 		{ id: "p-faction", label: "Faction", category: "page", description: "Members, storage, diplomacy", action: () => goto("/faction") },
-		{ id: "p-galaxy", label: "Galaxy Map", category: "page", description: "Interactive star map", action: () => goto("/galaxy") },
-		{ id: "p-activity", label: "Activity", category: "page", description: "Live event feed", action: () => goto("/activity") },
 		{ id: "p-market", label: "Market", category: "page", description: "Prices and arbitrage", action: () => goto("/market") },
-		{ id: "p-bots", label: "Bot Management", category: "page", description: "Fleet bots list", action: () => goto("/bots") },
 		{ id: "p-training", label: "Training Data", category: "page", description: "Stats and exports", action: () => goto("/training") },
 		{ id: "p-settings", label: "Settings", category: "page", description: "Goals, config, cache", action: () => goto("/settings") },
 	];
