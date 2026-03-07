@@ -52,19 +52,28 @@ bun run dev:web    # Dashboard dev server (separate terminal)
 
 ### Configuration
 
-Edit `config.toml`:
+Edit `config.toml` (see `config.toml.example` for all options):
 
 ```toml
 [commander]
 brain = "tiered"              # "scoring", "ollama", "gemini", "claude", "tiered"
 evaluation_interval = 60      # Seconds between fleet evaluations
+reassignment_cooldown = 300   # Seconds before a bot can be reassigned
 
 [ai]
 ollama_model = "qwen3:8b"
 gemini_model = "gemini-2.5-pro"
 claude_model = "claude-3-5-haiku-latest"
 tier_order = ["ollama", "gemini", "claude", "scoring"]
+max_tokens = 2048
 shadow_mode = true            # Compare AI vs scoring brain decisions
+
+[fleet]
+max_bots = 20
+default_storage_mode = "faction_deposit"  # "sell", "deposit", "faction_deposit"
+# home_system = ""            # Home system ID
+# home_base = ""              # Home station base ID
+# faction_storage_station = "" # Station for supply chain ops
 
 [[goals]]
 type = "maximize_income"

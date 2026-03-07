@@ -1,0 +1,69 @@
+# SpaceMolt Commander v3 Configuration
+# Copy this file to config.toml and edit with your settings:
+#   cp config.toml.example config.toml
+
+[commander]
+brain = "tiered"                  # "scoring", "ollama", "gemini", "claude", "tiered"
+evaluation_interval = 60          # Seconds between fleet evaluations
+reassignment_cooldown = 300       # Seconds before a bot can be reassigned
+reassignment_threshold = 0.3      # Score difference needed to trigger reassignment
+switch_cost_weight = 1.0          # Penalty for switching routines (higher = stickier)
+urgency_override = true           # Allow emergency overrides to bypass cooldown
+
+[ai]
+ollama_base_url = "http://localhost:11434"
+ollama_model = "qwen3:8b"
+gemini_model = "gemini-2.5-pro"
+claude_model = "claude-3-5-haiku-latest"
+tier_order = ["ollama", "gemini", "claude", "scoring"]
+max_latency_ms = 10000            # Max time to wait for LLM response
+max_tokens = 2048                 # Max tokens for LLM response
+shadow_mode = false               # Compare AI decisions vs scoring brain
+# prompt_file = "prompt.md"       # Optional: custom system prompt (loaded fresh each eval)
+
+[[goals]]
+type = "maximize_income"          # maximize_income, explore_region, prepare_for_war,
+priority = 1                      # level_skills, establish_trade_route, resource_stockpile,
+                                  # faction_operations, custom
+
+[fleet]
+max_bots = 20                     # Maximum concurrent bots
+login_stagger_ms = 5000           # Delay between bot logins
+snapshot_interval = 30            # Seconds between fleet snapshots
+default_storage_mode = "sell"     # "sell", "deposit", "faction_deposit"
+# home_system = ""                # Home system ID (for navigation)
+# home_base = ""                  # Home station base ID
+# faction_storage_station = ""    # Station with faction storage (for supply chain)
+# faction_tax_percent = 0         # Percent of profits deposited to faction treasury (0-100)
+# min_bot_credits = 0             # Minimum credits each bot should maintain
+
+[cache]
+market_ttl_ms = 300000            # Market data freshness (5 minutes)
+system_ttl_ms = 3600000           # System data freshness (1 hour)
+catalog_refresh = "on_version_change"  # "on_version_change" or "daily"
+
+[server]
+port = 3000
+host = "localhost"
+
+[training]
+log_decisions = true              # Log commander decisions for training data
+log_snapshots = true              # Log fleet state snapshots
+log_episodes = true               # Log routine episodes
+log_market_history = true         # Log market price history
+snapshot_interval = 30            # Seconds between training snapshots
+
+[economy]
+enable_premium_orders = true      # Allow premium pricing on sell orders
+max_premium_pct = 50              # Max premium above base price (%)
+min_crafting_margin_pct = 30      # Min profit margin for crafting decisions (%)
+batch_sell_size = 100             # Max units per sell order
+order_stale_timeout_min = 120     # Cancel unfilled orders after this many minutes
+
+# Stock targets — define inventory levels to maintain at specific stations
+# [[inventory_targets]]
+# station_id = "station_abc"
+# item_id = "refined_iron"
+# min_stock = 100
+# max_stock = 500
+# purpose = "crafting"            # crafting, trading, fuel, ammo, strategic
