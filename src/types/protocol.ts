@@ -376,6 +376,18 @@ export interface SocialForumThread {
   isOwnBot: boolean;
 }
 
+export interface SocialDM {
+  id: string;
+  fromPlayer: string;
+  fromUsername: string;
+  toPlayer: string;
+  toUsername: string;
+  content: string;
+  timestamp: string;
+  direction: "incoming" | "outgoing";
+  botUsername: string;
+}
+
 // ── Brain Decision Stats ──
 
 export interface BrainDecisionStats {
@@ -450,6 +462,7 @@ export type ServerMessage =
   | { type: "stuck_bots_update"; stuckBots: StuckBot[] }
   | { type: "social_chat_update"; messages: SocialChatMessage[] }
   | { type: "social_forum_update"; threads: SocialForumThread[] }
+  | { type: "social_dm_update"; messages: SocialDM[] }
   | { type: "brain_decision_stats"; stats: BrainDecisionStats }
   | { type: "catalog_data"; ships: ShipClass[]; items: CatalogItem[]; skills: Skill[]; recipes: Recipe[] };
 

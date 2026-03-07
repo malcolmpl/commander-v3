@@ -1,8 +1,20 @@
 <script lang="ts">
-	import { commanderLog, commanderMemory, stuckBots, brainHealth, bots, send, socialChat, socialForum } from "$stores/websocket";
+	import { commanderLog, commanderMemory, stuckBots, brainHealth, bots, send, socialChat, socialForum, socialDMs } from "$stores/websocket";
 	import BrainPanel from "$lib/components/BrainPanel.svelte";
 
-	let activeTab = $state<"chat" | "forum" | "thoughts" | "memory" | "stuck">("chat");
+	let activeTab = $state<"chat" | "dms" | "forum" | "thoughts" | "memory" | "stuck">("chat");
+
+	// DM filter
+	let dmFilter = $state<"all" | "incoming" | "outgoing">("all");
+	let dmBotFilter = $state("all");
+	const filteredDMs = $derived.by(() => {
+		let msgs = $socialDMs;
+		if (dmFilter === "incoming") msgs = msgs.filter(m => m.direction === "incoming");
+		else if (dmFilter === "outgoing") msgs = msgs.filter(m => m.direction === "outgoing");
+		if (dmBotFilter !== "all") msgs = msgs.filter(m => m.botUsername === dmBotFilter);
+		return msgs;
+	});
+	const dmBotNames = $derived([...new Set($socialDMs.map(m => m.botUsername))].sort());
 
 	// Full thought history across all evaluations
 	const allThoughts = $derived.by(() => {
@@ -129,6 +141,7 @@
 			<div class="flex items-center gap-1">
 				{#each [
 					{ value: "chat", label: "Chat", count: $socialChat.length },
+					{ value: "dms", label: "DMs", count: $socialDMs.length },
 					{ value: "forum", label: "Forum", count: $socialForum.length },
 					{ value: "thoughts", label: "LLM Thoughts", count: allThoughts.length },
 					{ value: "memory", label: "Knowledge Base", count: $commanderMemory.length },
@@ -198,6 +211,79 @@
 					</div>
 				</div>
 
+
+			{:else if activeTab === "dms"}
+				<!-- Direct Messages -->
+				<div class="card overflow-hidden">
+					<!-- DM filter bar -->
+					<div class="flex items-center gap-2 px-4 py-2 border-b border-hull-grey/20">
+						{#each [
+							{ value: "all", label: "All" },
+							{ value: "incoming", label: "Incoming" },
+							{ value: "outgoing", label: "Outgoing" },
+						] as f}
+							<button
+								class="px-2 py-1 text-[10px] rounded transition-colors {dmFilter === f.value
+									? 'bg-nebula-blue text-star-white'
+									: 'text-hull-grey hover:text-chrome-silver'}"
+								onclick={() => dmFilter = f.value as typeof dmFilter}
+							>
+								{f.label}
+							</button>
+						{/each}
+						{#if dmBotNames.length > 1}
+							<span class="text-hull-grey text-[10px] ml-2">Bot:</span>
+							<select
+								bind:value={dmBotFilter}
+								class="px-1.5 py-0.5 bg-nebula-blue/30 border border-hull-grey/30 rounded text-[10px] text-star-white"
+							>
+								<option value="all">All Bots</option>
+								{#each dmBotNames as name}
+									<option value={name}>{name}</option>
+								{/each}
+							</select>
+						{/if}
+						{#if $socialDMs.length > 0}
+							{@const incoming = $socialDMs.filter(m => m.direction === "incoming").length}
+							<span class="ml-auto text-[10px] text-hull-grey">{incoming} incoming, {$socialDMs.length - incoming} outgoing</span>
+						{/if}
+					</div>
+
+					<div class="max-h-[calc(100vh-320px)] overflow-y-auto p-4 space-y-1.5">
+						{#if filteredDMs.length === 0}
+							<div class="py-16 text-center">
+								<p class="text-hull-grey text-sm">No direct messages yet.</p>
+								<p class="text-hull-grey/60 text-xs mt-1">Private messages sent to or from your bots will appear here.</p>
+							</div>
+						{:else}
+							{#each filteredDMs as dm (dm.id)}
+								<div class="flex items-start gap-2 py-1.5 {dm.direction === 'outgoing' ? 'bg-plasma-cyan/5 rounded-lg px-2 -mx-2' : dm.direction === 'incoming' ? 'bg-warning-yellow/5 rounded-lg px-2 -mx-2' : ''}">
+									<!-- Direction indicator -->
+									<div class="shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold mt-0.5
+										{dm.direction === 'outgoing' ? 'bg-plasma-cyan/20 border border-plasma-cyan/40 text-plasma-cyan' : 'bg-warning-yellow/20 border border-warning-yellow/40 text-warning-yellow'}">
+										{dm.direction === 'outgoing' ? '\u2191' : '\u2193'}
+									</div>
+									<div class="flex-1 min-w-0">
+										<div class="flex items-center gap-2 mb-0.5">
+											{#if dm.direction === "incoming"}
+												<span class="text-xs font-semibold text-warning-yellow">{dm.fromUsername}</span>
+												<span class="text-[10px] text-hull-grey">\u2192</span>
+												<span class="text-xs text-plasma-cyan">{dm.botUsername}</span>
+											{:else}
+												<span class="text-xs font-semibold text-plasma-cyan">{dm.botUsername}</span>
+												<span class="text-[10px] text-hull-grey">\u2192</span>
+												<span class="text-xs text-chrome-silver">{dm.toUsername || dm.fromUsername}</span>
+											{/if}
+											<span class="px-1 py-0.5 text-[9px] rounded {dm.direction === 'incoming' ? 'bg-warning-yellow/10 text-warning-yellow' : 'bg-plasma-cyan/10 text-plasma-cyan'}">{dm.direction}</span>
+											<span class="text-[10px] text-hull-grey mono">{formatTime(dm.timestamp)}</span>
+										</div>
+										<p class="text-xs text-chrome-silver leading-relaxed">{dm.content}</p>
+									</div>
+								</div>
+							{/each}
+						{/if}
+					</div>
+				</div>
 			{:else if activeTab === "forum"}
 				<!-- Forum threads -->
 				<div class="card overflow-hidden">
@@ -373,6 +459,17 @@
 					<div class="flex items-center justify-between">
 						<span class="text-xs text-chrome-silver">From My Bots</span>
 						<span class="text-xs mono text-plasma-cyan">{ownMessages}</span>
+					</div>
+				{/if}
+				<div class="flex items-center justify-between">
+					<span class="text-xs text-chrome-silver">Direct Messages</span>
+					<span class="text-xs mono text-star-white">{$socialDMs.length}</span>
+				</div>
+				{#if $socialDMs.length > 0}
+					{@const incomingDMs = $socialDMs.filter(m => m.direction === "incoming").length}
+					<div class="flex items-center justify-between">
+						<span class="text-xs text-chrome-silver">Incoming DMs</span>
+						<span class="text-xs mono text-warning-yellow">{incomingDMs}</span>
 					</div>
 				{/if}
 				<div class="flex items-center justify-between">

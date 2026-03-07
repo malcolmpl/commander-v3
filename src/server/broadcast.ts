@@ -9,7 +9,7 @@ import type { Commander } from "../commander/commander";
 import type { EconomyEngine } from "../commander/economy-engine";
 import type { Galaxy } from "../core/galaxy";
 import type { DB } from "../data/db";
-import type { SocialChatMessage, SocialForumThread, FactionState, FactionMember, FactionFacility, OpenOrder, BrainDecisionStats } from "../types/protocol";
+import type { SocialChatMessage, SocialForumThread, SocialDM, FactionState, FactionMember, FactionFacility, OpenOrder, BrainDecisionStats } from "../types/protocol";
 import { creditHistory, activityLog } from "../data/schema";
 import { lt } from "drizzle-orm";
 import type { TrainingLogger } from "../data/training-logger";
@@ -577,6 +577,56 @@ async function pollSocialFeed(deps: BroadcastDeps): Promise<void> {
     broadcast({ type: "social_forum_update", threads: forumData });
   } catch {
     // Forum polling failure is non-critical
+  }
+
+  // Fetch DMs for each bot (private channel)
+  try {
+    const allDMs: SocialDM[] = [];
+    const readyBots = bots.filter(b => (b.status === "running" || b.status === "ready") && b.api);
+
+    // Fetch DMs from up to 5 bots in parallel to avoid hammering the API
+    const dmBots = readyBots.slice(0, 5);
+    const dmResults = await Promise.allSettled(
+      dmBots.map(b => b.api!.getChatHistory("private", 20))
+    );
+
+    for (let i = 0; i < dmResults.length; i++) {
+      const result = dmResults[i];
+      if (result.status !== "fulfilled") continue;
+      const bot = dmBots[i];
+
+      for (const msg of result.value) {
+        const isFromBot = botUsernames.has(msg.username.toLowerCase());
+        allDMs.push({
+          id: msg.id,
+          fromPlayer: msg.playerId,
+          fromUsername: msg.username,
+          toPlayer: isFromBot ? "" : bot.id,
+          toUsername: isFromBot ? "" : bot.username,
+          content: msg.content,
+          timestamp: msg.timestamp,
+          direction: isFromBot ? "outgoing" : "incoming",
+          botUsername: bot.username,
+        });
+      }
+    }
+
+    // Deduplicate and sort
+    const seen = new Set<string>();
+    const dedupedDMs = allDMs
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+      .filter(m => {
+        if (seen.has(m.id)) return false;
+        seen.add(m.id);
+        return true;
+      })
+      .slice(0, 100);
+
+    if (dedupedDMs.length > 0) {
+      broadcast({ type: "social_dm_update", messages: dedupedDMs });
+    }
+  } catch {
+    // DM polling failure is non-critical
   }
 }
 

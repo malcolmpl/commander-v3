@@ -26,6 +26,7 @@ import type {
   StuckBot,
   SocialChatMessage,
   SocialForumThread,
+  SocialDM,
 } from "../../../../src/types/protocol";
 import type { Goal } from "../../../../src/config/schema";
 
@@ -60,6 +61,7 @@ export const commanderMemory = writable<MemoryEntry[]>([]);
 export const stuckBots = writable<StuckBot[]>([]);
 export const socialChat = writable<SocialChatMessage[]>([]);
 export const socialForum = writable<SocialForumThread[]>([]);
+export const socialDMs = writable<SocialDM[]>([]);
 export const brainDecisionStats = writable<BrainDecisionStats | null>(null);
 
 // Galaxy detail (enriched with market data)
@@ -204,13 +206,33 @@ function handleMessage(event: MessageEvent) {
         stuckBots.set(msg.stuckBots);
         break;
 
-      case "social_chat_update":
-        socialChat.set(msg.messages);
+      case "social_chat_update": {
+        // Accumulate chat history, dedup by id, keep newest 200
+        const existingChat = get(socialChat);
+        const seenChat = new Set(existingChat.map(m => m.id));
+        const newChat = msg.messages.filter(m => !seenChat.has(m.id));
+        const merged = [...newChat, ...existingChat]
+          .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+          .slice(0, 200);
+        socialChat.set(merged);
         break;
+      }
 
       case "social_forum_update":
         socialForum.set(msg.threads);
         break;
+
+      case "social_dm_update": {
+        // Accumulate DM history, dedup by id, keep newest 200
+        const existingDMs = get(socialDMs);
+        const seenDMs = new Set(existingDMs.map(m => m.id));
+        const newDMs = msg.messages.filter(m => !seenDMs.has(m.id));
+        const mergedDMs = [...newDMs, ...existingDMs]
+          .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+          .slice(0, 200);
+        socialDMs.set(mergedDMs);
+        break;
+      }
 
       case "brain_decision_stats":
         brainDecisionStats.set(msg.stats);

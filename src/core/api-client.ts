@@ -730,8 +730,10 @@ export class ApiClient {
     return this.mutation("chat", { channel, content, target_id: targetId });
   }
 
-  async getChatHistory(channel: string, limit = 50): Promise<ChatMessage[]> {
-    const data = await this.query<any>("get_chat_history", { channel, limit });
+  async getChatHistory(channel: string, limit = 50, targetId?: string): Promise<ChatMessage[]> {
+    const params: Record<string, unknown> = { channel, limit };
+    if (targetId) params.target_id = targetId;
+    const data = await this.query<any>("get_chat_history", params);
     const messages = data.messages ?? data.history ?? (Array.isArray(data) ? data : []);
     return messages.map((m: any) => ({
       id: String(m.id ?? m.message_id ?? ""),
