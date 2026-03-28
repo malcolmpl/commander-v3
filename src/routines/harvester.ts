@@ -24,6 +24,8 @@ import {
   getParam,
   isProtectedItem,
   equipModulesForRoutine,
+  fleetGetSystem,
+  fleetGetPoi,
 } from "./helpers";
 
 interface HarvestTarget {
@@ -46,7 +48,7 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<RoutineYield, 
   if (rawTargets.length === 0) {
     yield "discovering harvest targets...";
     try {
-      const system = await ctx.api.getSystem();
+      const system = await fleetGetSystem(ctx);
       // Filter POIs by equipped modules
       const hasIceHarvester = ctx.ship.modules.some((m) =>
         m.moduleId.includes("ice_harvester") || m.name.toLowerCase().includes("ice harvester")
@@ -161,12 +163,10 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<RoutineYield, 
 
       if (ctx.shouldStop) return;
 
-      // Scan POI resources and persist to cache
+      // Scan POI resources and persist to cache (fleet-deduped)
       try {
-        const poiDetail = await ctx.api.getPoi();
-        if (poiDetail.resources.length > 0) {
-          ctx.galaxy.updatePoiResources(target.poiId, poiDetail.resources);
-        }
+        await fleetGetPoi(ctx, target.poiId);
+        // fleetGetPoi already calls updatePoiResources
       } catch {
         // Non-fatal: continue harvesting even if POI scan fails
       }
@@ -250,6 +250,7 @@ export async function* harvester(ctx: BotContext): AsyncGenerator<RoutineYield, 
       try {
         if (mode === "faction_deposit") {
           await ctx.api.factionDepositItems(item.itemId, item.quantity);
+          ctx.cache.invalidateFactionStorage();
         } else {
           await depositItem(ctx, item.itemId);
         }

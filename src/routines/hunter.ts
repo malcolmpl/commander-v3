@@ -32,6 +32,7 @@ import {
   getParam,
   interruptibleSleep,
   payFactionTax,
+  fleetGetSystem,
 } from "./helpers";
 
 // Weapon module patterns — hunter must have at least one actual combat weapon
@@ -217,8 +218,7 @@ export async function* hunter(ctx: BotContext): AsyncGenerator<RoutineYield, voi
         if (neighbors.length === 0) {
           yield "no galaxy data for current system, scanning";
           try {
-            const sysData = await ctx.api.getSystem();
-            ctx.galaxy.updateSystem(sysData);
+            await fleetGetSystem(ctx);
           } catch (err) {
             yield `system scan failed: ${err instanceof Error ? err.message : String(err)}`;
           }
@@ -414,8 +414,15 @@ async function* battleLoop(
   fleeThreshold: number,
 ): AsyncGenerator<RoutineYield, void, void> {
   let battleActive = true;
+  const battleStart = Date.now();
+  const BATTLE_TIMEOUT = 300_000; // 5 minute safety timeout
 
   while (battleActive && !ctx.shouldStop) {
+    if (Date.now() - battleStart > BATTLE_TIMEOUT) {
+      yield "battle timeout — disengaging";
+      try { await ctx.api.battle("flee"); } catch { /* ignore */ }
+      break;
+    }
     try {
       const battle = await ctx.api.getBattleStatus();
       if (!battle) {

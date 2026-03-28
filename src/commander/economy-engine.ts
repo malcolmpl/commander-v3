@@ -17,14 +17,14 @@ import type {
 
 /** Fallback production rates per routine (used when no observed data yet) */
 const FALLBACK_PRODUCTION: Record<string, { itemId: string; qtyPerHour: number }[]> = {
-  miner: [{ itemId: "ore_iron", qtyPerHour: 20 }],
-  harvester: [{ itemId: "ore_ice_nitrogen", qtyPerHour: 15 }],
-  crafter: [{ itemId: "refined_steel", qtyPerHour: 5 }],
+  miner: [{ itemId: "ore_iron", qtyPerHour: 60 }],
+  harvester: [{ itemId: "ore_ice_nitrogen", qtyPerHour: 40 }],
+  crafter: [{ itemId: "refined_steel", qtyPerHour: 15 }],
 };
 
 /** Fallback consumption rates per routine */
 const FALLBACK_CONSUMPTION: Record<string, { itemId: string; qtyPerHour: number }[]> = {
-  crafter: [{ itemId: "ore_iron", qtyPerHour: 10 }],
+  crafter: [{ itemId: "ore_iron", qtyPerHour: 30 }],
 };
 
 /** Sliding window duration for observed production tracking (1 hour) */
@@ -56,17 +56,20 @@ export class EconomyEngine {
   }
 
   /**
-   * Observed production/consumption per bot: botId → itemId → timestamped events.
-   * Events are trimmed to the observation window on each analyze() call.
+   * Observed production/consumption per bot: botId → timestamped events.
+   * Trimmed in bulk every TRIM_INTERVAL_MS (not per-read).
    */
   private observedProduction = new Map<string, Array<{ itemId: string; qty: number; at: number }>>();
   private observedConsumption = new Map<string, Array<{ itemId: string; qty: number; at: number }>>();
+  private lastTrimTime = 0;
+  private static readonly TRIM_INTERVAL_MS = 5 * 60_000; // Bulk trim every 5 minutes
 
   /** Record an observed production event (e.g., miner deposited 10 ore_iron) */
   recordProduction(botId: string, itemId: string, qty: number): void {
     if (qty <= 0) return;
     if (!this.observedProduction.has(botId)) this.observedProduction.set(botId, []);
     this.observedProduction.get(botId)!.push({ itemId, qty, at: Date.now() });
+    this.trimIfNeeded();
   }
 
   /** Record an observed consumption event (e.g., crafter consumed 5 ore_iron) */
@@ -74,6 +77,22 @@ export class EconomyEngine {
     if (qty <= 0) return;
     if (!this.observedConsumption.has(botId)) this.observedConsumption.set(botId, []);
     this.observedConsumption.get(botId)!.push({ itemId, qty, at: Date.now() });
+    this.trimIfNeeded();
+  }
+
+  /** Bulk trim stale observations (runs at most every 5 minutes) */
+  private trimIfNeeded(): void {
+    const now = Date.now();
+    if (now - this.lastTrimTime < EconomyEngine.TRIM_INTERVAL_MS) return;
+    this.lastTrimTime = now;
+    const cutoff = now - OBSERVATION_WINDOW_MS;
+    for (const store of [this.observedProduction, this.observedConsumption]) {
+      for (const [botId, events] of store) {
+        const trimmed = events.filter(e => e.at >= cutoff);
+        if (trimmed.length === 0) store.delete(botId);
+        else store.set(botId, trimmed);
+      }
+    }
   }
 
   /** Get observed per-hour rates for a bot (production) */
@@ -84,21 +103,22 @@ export class EconomyEngine {
 
     const now = Date.now();
     const cutoff = now - OBSERVATION_WINDOW_MS;
-    // Trim old events
-    const recent = events.filter((e) => e.at >= cutoff);
-    store.set(botId, recent);
 
-    if (recent.length === 0) return new Map();
-
-    // Sum quantities per item
+    // Sum quantities per item (skip stale inline — no mutation needed, bulk trim handles cleanup)
     const sums = new Map<string, number>();
-    for (const e of recent) {
+    let oldestRecent = now;
+    let hasRecent = false;
+    for (const e of events) {
+      if (e.at < cutoff) continue;
       sums.set(e.itemId, (sums.get(e.itemId) ?? 0) + e.qty);
+      if (e.at < oldestRecent) oldestRecent = e.at;
+      hasRecent = true;
     }
 
+    if (!hasRecent) return new Map();
+
     // Convert to per-hour rate: qty / (window hours elapsed)
-    const oldestEvent = recent[0].at;
-    const elapsed = Math.max(now - oldestEvent, 60_000); // Min 1 minute to avoid division by tiny number
+    const elapsed = Math.max(now - oldestRecent, 60_000); // Min 1 minute to avoid division by tiny number
     const hoursElapsed = elapsed / 3_600_000;
 
     const rates = new Map<string, number>();
@@ -396,7 +416,7 @@ export class EconomyEngine {
     }
 
     // Low-stock ores not covered by deficits
-    const LOW_ORE_THRESHOLD = 10;
+    const LOW_ORE_THRESHOLD = 50;
     const coveredOres = new Set(orders.filter(o => o.type === "mine").map(o => o.targetId));
     for (const [itemId, qty] of oreStock) {
       if (coveredOres.has(itemId)) continue;
@@ -474,16 +494,16 @@ export class EconomyEngine {
       });
     }
 
-    // ── Sell overstocked raw ores (5000+) ──
+    // ── Sell overstocked raw ores (3000+) ──
     for (const [itemId, qty] of oreStock) {
-      if (qty >= 5000) {
+      if (qty >= 3000) {
         orders.push({
           type: "trade",
           targetId: itemId,
           description: `Sell excess ${itemId.replace(/_/g, " ")}`,
-          priority: 50,
+          priority: Math.min(80, 50 + Math.round((qty - 3000) / 500)),
           reason: `overstocked: ${qty} units`,
-          quantity: qty - 2000, // Keep 2000 reserve
+          quantity: qty - 1000, // Keep 1000 reserve
         });
       }
     }

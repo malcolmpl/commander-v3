@@ -34,7 +34,7 @@ const ALL_ROUTINES: RoutineName[] = [
 ];
 
 /** Routines that operate in the field and should not be interrupted for return_home */
-const FIELD_ROUTINES: Set<RoutineName> = new Set(["trader", "hunter", "explorer"]);
+const FIELD_ROUTINES: Set<RoutineName> = new Set(["trader", "hunter", "explorer", "miner", "harvester"]);
 
 /** Maximum concurrent bots per routine (enforced in greedy assignment loop) */
 /** Note: explorer scales with fleet size — see getMaxCount() */
@@ -82,9 +82,9 @@ export interface ScoringConfig {
 
 /** Per-routine cooldowns — fast-cycling routines get shorter cooldowns */
 const ROUTINE_COOLDOWNS: Partial<Record<RoutineName, number>> = {
-  miner: 60_000,           // 1 min — rapid mine/sell cycles
+  miner: 600_000,          // 10 min — crystal miners do 13-jump round trips, need time to fill holds
   crafter: 90_000,         // 1.5 min — batch craft cycles
-  harvester: 60_000,       // 1 min — same as miner
+  harvester: 600_000,      // 10 min — same as miner
   trader: 240_000,         // 4 min — multi-jump routes need time
   explorer: 180_000,       // 3 min — travel-heavy
   mission_runner: 180_000, // 3 min — multi-step missions
@@ -128,6 +128,7 @@ export class ScoringBrain implements CommanderBrain {
   private reassignmentState = new Map<string, ReassignmentState>();
   /** Persistent tracking of active miner/harvester → belt assignments across eval cycles */
   private activeBeltAssignments = new Map<string, string>(); // botId → beltPoiId
+  private beltAssignmentTimestamps = new Map<string, number>(); // botId → timestamp
 
   constructor(config?: Partial<ScoringConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -156,11 +157,14 @@ export class ScoringBrain implements CommanderBrain {
       (b) => b.status === "ready" || b.status === "running"
     );
 
-    // Clean up stale belt assignments: remove bots no longer mining
+    // Clean up stale belt assignments: remove bots no longer mining or expired (30min TTL)
+    const BELT_ASSIGNMENT_TTL = 1_800_000; // 30 minutes
     for (const [botId] of this.activeBeltAssignments) {
       const bot = fleet.bots.find((b) => b.botId === botId);
-      if (!bot || (bot.routine !== "miner" && bot.routine !== "harvester")) {
+      const assignedAt = this.beltAssignmentTimestamps.get(botId) ?? 0;
+      if (!bot || (bot.routine !== "miner" && bot.routine !== "harvester") || (now - assignedAt > BELT_ASSIGNMENT_TTL)) {
         this.activeBeltAssignments.delete(botId);
+        this.beltAssignmentTimestamps.delete(botId);
       }
     }
 
@@ -201,7 +205,15 @@ export class ScoringBrain implements CommanderBrain {
       return true;
     });
 
-    // Score all bot × routine combinations
+    // Count current routine distribution (from previous cycle) — needed by early filter
+    const routineCounts = new Map<RoutineName, number>();
+    for (const bot of fleet.bots) {
+      if (bot.routine) {
+        routineCounts.set(bot.routine, (routineCounts.get(bot.routine) ?? 0) + 1);
+      }
+    }
+
+    // Score all bot × routine combinations (with early filtering to reduce work)
     const allScores: BotScore[] = [];
     for (const bot of candidates) {
       // Specialist bots: only score allowed routines for their role
@@ -210,6 +222,21 @@ export class ScoringBrain implements CommanderBrain {
         ? activeRoutines.filter((r) => getAllowedRoutines(botRole).includes(r))
         : activeRoutines; // Generalist (no role) scores all routines
       for (const routine of botRoutines) {
+        // Early skip: routine has 0 base score AND no pending work (ship_upgrade/refit already filtered above)
+        const baseScore = this.config.baseScores[routine] * weights[routine];
+        if (baseScore <= 0 && routine !== "return_home") continue;
+
+        // Early skip: bot has active rapid penalty for this routine (it just failed)
+        const rapidAt = bot.rapidRoutines.get(routine);
+        if (rapidAt && (now - rapidAt) < 30_000) continue; // Skip if failed within last 30s
+
+        // Early skip: routine at max count from previous cycle AND bot isn't already on it
+        const maxCount = getMaxCount(routine, fleetSize);
+        if (maxCount !== undefined && bot.routine !== routine) {
+          const alreadyOn = routineCounts.get(routine) ?? 0;
+          if (alreadyOn >= maxCount) continue;
+        }
+
         const score = this.scoreAssignment(bot, routine, weights, economy, fleet, world);
         allScores.push(score);
       }
@@ -218,15 +245,6 @@ export class ScoringBrain implements CommanderBrain {
     // Greedy assignment: pick best score for each bot
     const assignments: Assignment[] = [];
     const assignedBots = new Set<string>();
-    const routineCounts = new Map<RoutineName, number>();
-
-    // Count current routine distribution (from previous cycle)
-    for (const bot of fleet.bots) {
-      if (bot.routine) {
-        routineCounts.set(bot.routine, (routineCounts.get(bot.routine) ?? 0) + 1);
-      }
-    }
-
     // Track routines assigned THIS cycle for dynamic diversity
     const cycleRoutineCounts = new Map<RoutineName, number>();
 
@@ -602,12 +620,17 @@ export class ScoringBrain implements CommanderBrain {
 
     // 7. Rapid completion penalty: routine recently failed to find work (completed in < 60s)
     //    Tracks ALL recently-failed routines (not just the last one) to prevent alternating failures
-    //    Penalty scales with repeat count: 50 for 1st, 80 for 2nd, 110 for 3rd
+    //    Penalty scales with how recently it failed: 80 if fresh, decays to 20 near expiry
     const RAPID_EXPIRY_MS = 180_000; // 3 minutes (longer decay prevents re-selecting failing routines)
     const rapidAt = bot.rapidRoutines.get(routine);
-    const rapidPenalty = (rapidAt && (Date.now() - rapidAt) < RAPID_EXPIRY_MS)
-      ? 50 // Moderate penalty — suppresses but doesn't kill all options
-      : 0;
+    let rapidPenalty = 0;
+    if (rapidAt) {
+      const elapsed = Date.now() - rapidAt;
+      if (elapsed < RAPID_EXPIRY_MS) {
+        // Linear decay: 80 → 20 over the expiry window
+        rapidPenalty = Math.round(80 - (elapsed / RAPID_EXPIRY_MS) * 60);
+      }
+    }
 
     // 8. Information scarcity bonus: uses world context for data-aware scoring
     //    Scaled by strategy weight so income goals suppress exploration bonuses
@@ -762,14 +785,22 @@ export class ScoringBrain implements CommanderBrain {
         if (oreInStorage >= 20) return 40;   // Decent supply
         if (oreInStorage >= 3) return 20;    // Minimum viable batch
         return 0;
-      case "miner":
-        // Miner gets bonus when storage is empty, penalty when ore is piling up
-        if (oreInStorage < 3) return 25;    // Storage empty — need to mine
-        if (oreInStorage < 10) return 10;   // Low ore — keep mining
-        if (oreInStorage < 30) return 0;    // Neutral — enough ore for now
-        if (oreInStorage < 100) return -20; // Piling up — crafter should take priority
-        if (oreInStorage < 1000) return -60; // Over-stocked — stop mining
-        return -120; // 1000+ ore: massive penalty — storage overflowing, absolutely stop mining
+      case "miner": {
+        // Deficit-aware: check per-ore-type scarcity vs surplus
+        let scarceCount = 0;   // ore types with < 200 stock
+        let surplusCount = 0;  // ore types with > 5000 stock
+        for (const [, qty] of oreBreakdown) {
+          if (qty < 200) scarceCount++;
+          if (qty > 5000) surplusCount++;
+        }
+        // If any ore type is scarce, mining is still valuable
+        if (scarceCount > 0) return 15;
+        // No scarce ores — apply heavy penalty based on total stockpile
+        if (oreInStorage < 30) return 0;
+        if (oreInStorage < 100) return -20;
+        if (oreInStorage < 1000) return -60;
+        return -120;
+      }
       case "trader":
         // Trader gets bonus when refined/crafted goods are in storage (ready to sell)
         // These are the high-margin items — ore refined into valuable products
@@ -980,9 +1011,13 @@ export class ScoringBrain implements CommanderBrain {
     const hasModule = (pattern: string) => mods.some((id) => id.includes(pattern));
 
     switch (routine) {
-      case "miner":
-        // No penalty — mining works with starter ships
+      case "miner": {
+        // Must have at least one extraction module to mine
+        const hasMiningGear = hasModule("mining_laser") || hasModule("drill")
+          || hasModule("ice_harvester") || hasModule("gas_harvester");
+        if (!hasMiningGear) return 150; // Heavy penalty — bot will waste fuel traveling to belts for nothing
         return 0;
+      }
       case "harvester": {
         // Harvester is only valuable with specialized modules (ice/gas harvesters)
         // Without them, it does the same thing as miner but with worse params
@@ -1204,8 +1239,13 @@ export class ScoringBrain implements CommanderBrain {
       case "miner": {
         const params = this.buildMinerParams(bot, economy, existingAssignments, world);
         // Persist belt assignment for cross-cycle deconfliction
-        if (params.targetBelt) this.activeBeltAssignments.set(bot.botId, String(params.targetBelt));
-        else this.activeBeltAssignments.delete(bot.botId);
+        if (params.targetBelt) {
+          this.activeBeltAssignments.set(bot.botId, String(params.targetBelt));
+          this.beltAssignmentTimestamps.set(bot.botId, Date.now());
+        } else {
+          this.activeBeltAssignments.delete(bot.botId);
+          this.beltAssignmentTimestamps.delete(bot.botId);
+        }
         return params;
       }
       case "harvester":
@@ -1422,6 +1462,9 @@ export class ScoringBrain implements CommanderBrain {
           .some(([itemId, qty]) => itemId.includes(pattern) && qty > 0);
         if (inStorage) {
           score += (wantCount - haveCount) * 25; // 25 per missing module with supply
+        } else {
+          // Even without storage supply, unequipped bots need refit (can buy from market)
+          score += (wantCount - haveCount) * 15; // 15 per missing module without supply
         }
       }
 
@@ -1433,6 +1476,11 @@ export class ScoringBrain implements CommanderBrain {
           score += (bestAvailableTier - currentTier) * 15; // 15 per tier level improvement
         }
       }
+    }
+
+    // Totally unequipped bots get an urgency boost — they're useless without modules
+    if (mods.length === 0 && desired.length > 0) {
+      score += 50; // Strong urgency: bot can't do ANY work without modules
     }
 
     // Module wear: low durability means modules need repair (refit handles this)
@@ -1647,6 +1695,9 @@ export class ScoringBrain implements CommanderBrain {
         // Skip intermediates (they feed higher-tier recipes regardless of own price)
         score -= hasMarketData ? 150 : 100; // Stronger penalty when market confirms it's unprofitable
         reason += ` -UNPROFITABLE:${profit}cr${hasMarketData ? "(mkt)" : ""}`;
+      } else if (profit === 0) {
+        score -= 30; // Deprioritize break-even recipes
+        reason += " -BREAKEVEN";
       }
 
       // Factor 4: Supply chain value — output feeds higher-tier recipes
@@ -1912,9 +1963,21 @@ export class ScoringBrain implements CommanderBrain {
         // Also factor in low storage (general need even without active crafter assignments)
         if (stock < 10) storageScore += (10 - stock) * 2;
         // Surplus penalty — strongly avoid mining ores already overstocked
-        if (stock > 1000) storageScore -= Math.min(200, Math.round(stock / 50));
+        if (stock > 80000) storageScore -= 5000;  // Near faction cap (100k) — effectively skip
+        else if (stock > 50000) storageScore -= Math.round(stock / 10);
+        else if (stock > 1000) storageScore -= Math.round(stock / 25);
         else if (stock > 100) storageScore -= Math.round(stock / 10);
       }
+
+      // Hard skip: if ALL resources at this belt type have >80000 stock (near 100k cap), skip entirely
+      const allAtCap = orePatterns.every(prefix => {
+        let stock = 0;
+        for (const [itemId, qty] of economy.factionStorage) {
+          if (itemId.startsWith(prefix)) stock += qty;
+        }
+        return stock > 80000;
+      });
+      if (allAtCap) continue; // Don't even consider this belt type — all ores near faction cap
 
       poiScores.push({ poiType: norm, score: demandScore + storageScore });
     }
@@ -2007,8 +2070,9 @@ export class ScoringBrain implements CommanderBrain {
         ? (economy.factionStorage.get(neededModule) ?? 0) > 0
         : false;
 
-      // Skip ice/gas if bot lacks module AND none in faction storage
-      if (neededModule && !hasModule && !moduleInStorage) continue;
+      // Skip ice/gas/nebula POIs if bot doesn't have the required module equipped.
+      // Don't send bots to equip-on-the-fly — it causes "no_equipment" errors at the belt.
+      if (neededModule && !hasModule) continue;
 
       // Build equip/unequip lists
       const equipModules: string[] = [];

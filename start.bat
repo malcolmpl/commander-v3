@@ -9,7 +9,7 @@ echo.
 
 :: Start backend
 echo Starting backend on port 3000...
-start "Commander Backend" cmd /c "cd /d %~dp0 && bun run src/app.ts"
+start "Commander Backend" cmd /c "cd /d %~dp0 && bun run --watch src/app.ts"
 
 :: Wait a moment for backend to start
 ping -n 3 127.0.0.1 >nul

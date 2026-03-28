@@ -105,6 +105,15 @@ export const ServerConfigSchema = z.object({
   host: z.string().default("localhost"),
 });
 
+// ── Broadcast Config ──
+
+export const BroadcastConfigSchema = z.object({
+  tick_interval_ms: z.number().min(1000).default(3_000),
+  snapshot_interval_ticks: z.number().min(1).default(10),
+  credit_history_interval_ticks: z.number().min(1).default(10),
+  max_global_snapshots: z.number().min(100).default(10_000),
+});
+
 // ── Training Config ──
 
 export const TrainingConfigSchema = z.object({
@@ -148,6 +157,7 @@ export const AppConfigSchema = z.object({
   server: ServerConfigSchema.default({}),
   training: TrainingConfigSchema.default({}),
   economy: EconomyConfigSchema.default({}),
+  broadcast: BroadcastConfigSchema.default({}),
   inventory_targets: z.array(StockTargetSchema).default([]),
 });
 

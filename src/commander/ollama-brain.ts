@@ -32,12 +32,12 @@ export function createOllamaBrain(config: OllamaBrainConfig = {}): OllamaNativeB
 }
 
 class OllamaNativeBrain implements CommanderBrain {
-  readonly name: string;
-  private readonly baseUrl: string;
-  private readonly model: string;
-  private readonly maxTokens: number;
-  private readonly timeoutMs: number;
-  private readonly systemPrompt: string;
+  name: string;
+  private baseUrl: string;
+  private model: string;
+  private maxTokens: number;
+  private timeoutMs: number;
+  private systemPrompt: string;
 
   // Health tracking
   private latencies: number[] = [];
@@ -55,6 +55,34 @@ class OllamaNativeBrain implements CommanderBrain {
     this.timeoutMs = config.timeoutMs ?? 60_000;
     this.name = `ollama/${this.model}`;
     this.systemPrompt = buildSystemPrompt(config.promptFile);
+  }
+
+  /** Get current model name */
+  getModel(): string { return this.model; }
+
+  /** Get current base URL */
+  getBaseUrl(): string { return this.baseUrl; }
+
+  /** Switch to a different model at runtime (resets health stats) */
+  setModel(model: string): void {
+    if (model === this.model) return;
+    this.model = model;
+    this.name = `ollama/${model}`;
+    // Reset health stats for new model
+    this.latencies = [];
+    this.successes = [];
+    this.lastError = undefined;
+    console.log(`[OllamaBrain] Model switched to: ${model}`);
+  }
+
+  /** Update base URL at runtime */
+  setBaseUrl(url: string): void {
+    this.baseUrl = url;
+  }
+
+  /** Update timeout at runtime */
+  setTimeoutMs(ms: number): void {
+    this.timeoutMs = ms;
   }
 
   async evaluate(input: EvaluationInput): Promise<EvaluationOutput> {

@@ -344,10 +344,13 @@ export class ApiClient {
     return orders;
   }
 
-  async viewOrders(stationId?: string): Promise<MarketOrder[]> {
-    const data = await this.query<{ orders?: Array<Record<string, unknown>> }>(
+  async viewOrders(stationId?: string, scope?: "personal" | "faction"): Promise<MarketOrder[]> {
+    const params: Record<string, unknown> = {};
+    if (stationId) params.station_id = stationId;
+    if (scope) params.scope = scope;
+    const data = await this.query<{ orders?: Array<Record<string, unknown>>; total?: number }>(
       "view_orders",
-      stationId ? { station_id: stationId } : {}
+      params
     );
     const orders = data.orders ?? (Array.isArray(data) ? data : []);
     return orders.map(normalizeMarketOrder);
@@ -1561,7 +1564,7 @@ function normalizePoi(raw: Record<string, unknown>): PoiDetail {
 function normalizeMarketOrder(raw: Record<string, unknown>): MarketOrder {
   return {
     id: str(raw.order_id ?? raw.id),
-    type: str(raw.type) as "buy" | "sell",
+    type: str(raw.type || raw.order_type || raw.side) as "buy" | "sell",
     itemId: str(raw.item_id),
     itemName: str(raw.item_name),
     quantity: num(raw.quantity),
@@ -1648,6 +1651,17 @@ function normalizeMission(raw: Record<string, unknown>): Mission {
     requiredQuantity: raw.required_quantity ? num(raw.required_quantity) : raw.requiredQuantity ? num(raw.requiredQuantity) : undefined,
     expiresAt: raw.expires_at ? str(raw.expires_at) : raw.expiresAt ? str(raw.expiresAt) : undefined,
     difficulty: raw.difficulty ? str(raw.difficulty) : undefined,
+    // Issuing station
+    issuingBase: raw.issuing_base_id ? str(raw.issuing_base_id) : raw.issuingBaseId ? str(raw.issuingBaseId) : undefined,
+    issuingSystem: raw.issuing_system_id ? str(raw.issuing_system_id) : raw.issuingSystemId ? str(raw.issuingSystemId) : undefined,
+    // Trade mission fields (v0.241.0)
+    sourceBase: raw.source_base ? str(raw.source_base) : raw.sourceBase ? str(raw.sourceBase) : undefined,
+    sourceSystem: raw.source_system ? str(raw.source_system) : raw.sourceSystem ? str(raw.sourceSystem) : undefined,
+    destinationBase: raw.destination_base ? str(raw.destination_base) : raw.destinationBase ? str(raw.destinationBase) : undefined,
+    destinationSystem: raw.destination_system ? str(raw.destination_system) : raw.destinationSystem ? str(raw.destinationSystem) : undefined,
+    buyPrice: raw.buy_price ? num(raw.buy_price) : raw.buyPrice ? num(raw.buyPrice) : undefined,
+    sellPrice: raw.sell_price ? num(raw.sell_price) : raw.sellPrice ? num(raw.sellPrice) : undefined,
+    estimatedProfit: raw.estimated_profit ? num(raw.estimated_profit) : raw.estimatedProfit ? num(raw.estimatedProfit) : undefined,
   };
 }
 

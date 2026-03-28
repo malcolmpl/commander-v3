@@ -1,7 +1,10 @@
 /**
  * Chat Intelligence — reads global/faction chat, extracts trade offers,
- * market intel, and player activity. Generates contextual replies.
+ * market intel, and player activity. Generates natural LLM-powered replies.
  * Stores learned facts in MemoryStore for commander decision-making.
+ *
+ * Reply system: regex detects interesting messages → LLM generates natural
+ * response with fleet context → queued with rate limiting → sent via API.
  */
 
 import type { ApiClient, ChatMessage } from "../core/api-client";
@@ -30,6 +33,21 @@ interface PendingReply {
   channel: string;
   content: string;
   targetId?: string;
+}
+
+/** Fleet context snapshot for LLM chat persona */
+export interface ChatFleetContext {
+  factionName: string;
+  factionTag: string;
+  botCount: number;
+  totalCredits: number;
+  homeSystem: string;
+  /** Items we're selling (name → qty) */
+  selling: Array<{ item: string; qty: number; price?: number }>;
+  /** Items we need (deficits) */
+  buying: Array<{ item: string }>;
+  /** Systems we operate in */
+  systems: string[];
 }
 
 // Known item keywords for matching
@@ -64,11 +82,28 @@ export class ChatIntelligence {
   private readonly REPLY_COOLDOWN_MS = 60_000; // Don't reply more than once per minute
   private readonly MAX_INTEL_AGE_MS = 30 * 60_000; // Keep intel for 30 minutes
 
+  /** Ollama config for LLM-powered replies */
+  private ollamaUrl: string;
+  private ollamaModel: string;
+  /** Fleet context updated by broadcast loop */
+  private fleetContext: ChatFleetContext | null = null;
+  /** Conversation history per player (for multi-turn DMs) */
+  private conversationHistory = new Map<string, Array<{ role: string; content: string }>>();
+  private readonly MAX_CONVERSATION_TURNS = 6;
+
   constructor(
     private memoryStore: MemoryStore | undefined,
     ownBotNames: string[],
+    ollamaConfig?: { baseUrl?: string; model?: string },
   ) {
     this.ownBotNames = new Set(ownBotNames.map(n => n.toLowerCase()));
+    this.ollamaUrl = ollamaConfig?.baseUrl ?? "http://localhost:11434";
+    this.ollamaModel = ollamaConfig?.model ?? "qwen3:8b";
+  }
+
+  /** Update fleet context (called by broadcast loop each tick) */
+  setFleetContext(ctx: ChatFleetContext): void {
+    this.fleetContext = ctx;
   }
 
   /** Update the set of own bot names (call when bots change) */
@@ -313,63 +348,24 @@ export class ChatIntelligence {
     for (const msg of messages) {
       // Skip own bots
       if (this.ownBotNames.has(msg.username.toLowerCase())) continue;
+      // Skip police/NPC messages
+      if (msg.username.startsWith("[POLICE]") || msg.username.includes("Patrol")) continue;
 
-      const content = msg.content.trim().toLowerCase();
+      const content = msg.content.trim();
+      const lower = content.toLowerCase();
 
-      // Only respond to trade-relevant messages
+      // Determine if this message warrants a reply
+      const isTrade = (BUY_REGEX.test(lower) || SELL_REGEX.test(lower)) && ITEM_PATTERNS.some(p => lower.includes(p));
+      const isQuestion = QUESTION_REGEX.test(content);
+      const isWarning = WARNING_REGEX.test(lower);
+      const mentionsUs = lower.includes("cast") || lower.includes("castellan") || this.ownBotNames.has(msg.username.toLowerCase());
+      const isSocial = !isTrade && !isQuestion && !isWarning && ITEM_PATTERNS.some(p => lower.includes(p));
 
-      // 1. Someone looking to buy something we might sell
-      if (BUY_REGEX.test(content) && ITEM_PATTERNS.some(p => content.includes(p))) {
-        const item = ITEM_PATTERNS.find(p => content.includes(p));
-        if (item) {
-          const reply = this.generateTradeReply(msg.username, item, "buying");
-          if (reply) {
-            this.replyQueue.push({ channel, content: reply });
-          }
-        }
-        continue;
-      }
+      // Only reply to actionable messages
+      if (!isTrade && !isQuestion && !isWarning && !mentionsUs && !isSocial) continue;
 
-      // 2. Someone selling something we might need
-      if (SELL_REGEX.test(content) && ITEM_PATTERNS.some(p => content.includes(p))) {
-        const item = ITEM_PATTERNS.find(p => content.includes(p));
-        if (item && (item.includes("ore") || item.includes("fuel") || item.includes("crystal"))) {
-          this.replyQueue.push({
-            channel,
-            content: `Interested in ${item}. What's your price and quantity?`,
-          });
-        }
-        continue;
-      }
-
-      // 3. Pirate/danger warnings — acknowledge and relay
-      if (WARNING_REGEX.test(content)) {
-        const location = content.match(LOCATION_REGEX)?.[1]?.trim();
-        if (location) {
-          this.replyQueue.push({
-            channel,
-            content: `Thanks for the warning about ${location}. We'll steer clear.`,
-          });
-        }
-        continue;
-      }
-
-      // 4. Someone asking where to find ore/resources — share if we know
-      if (QUESTION_REGEX.test(content) && ITEM_PATTERNS.some(p => content.includes(p))) {
-        const item = ITEM_PATTERNS.find(p => content.includes(p));
-        if (item) {
-          // Check memory for location intel
-          const locationFact = this.memoryStore?.getAll().find(
-            m => m.fact.toLowerCase().includes(item) && m.fact.toLowerCase().includes("at ")
-          );
-          if (locationFact) {
-            this.replyQueue.push({
-              channel,
-              content: `${msg.username}, from our intel: ${locationFact.fact}`,
-            });
-          }
-        }
-      }
+      // Queue LLM reply (async — will be generated when sendReplies is called)
+      this.queueLlmReply(msg, channel, { isTrade, isQuestion, isWarning, mentionsUs });
     }
 
     // Limit queue size
@@ -378,17 +374,182 @@ export class ChatIntelligence {
     }
   }
 
-  private generateTradeReply(buyer: string, item: string, _direction: "buying" | "selling"): string | null {
-    // Check if we have this item in recent intel or memory
-    const relevantIntel = this.recentIntel.find(
-      i => i.type === "trade_offer" && i.item === item && i.direction === "selling"
-    );
+  /**
+   * Queue a message for LLM reply generation.
+   * The actual LLM call happens here (async), result pushed to replyQueue.
+   */
+  private queueLlmReply(
+    msg: ChatMessage,
+    channel: string,
+    context: { isTrade: boolean; isQuestion: boolean; isWarning: boolean; mentionsUs: boolean },
+  ): void {
+    // Generate reply async — fire and forget into queue
+    this.generateLlmReply(msg, channel, context).then(reply => {
+      if (reply) {
+        this.replyQueue.push({ channel, content: reply });
+      }
+    }).catch(() => {
+      // LLM failed — fall back to simple template reply
+      const fallback = this.templateFallback(msg, context);
+      if (fallback) {
+        this.replyQueue.push({ channel, content: fallback });
+      }
+    });
+  }
 
-    if (relevantIntel && relevantIntel.source !== buyer) {
-      return `${buyer}, saw ${relevantIntel.source} selling ${item} recently. Might want to check with them.`;
+  /** Generate a natural reply via Ollama */
+  private async generateLlmReply(
+    msg: ChatMessage,
+    channel: string,
+    context: { isTrade: boolean; isQuestion: boolean; isWarning: boolean; mentionsUs: boolean },
+  ): Promise<string | null> {
+    const systemPrompt = this.buildChatPersona();
+    const userPrompt = this.buildChatPrompt(msg, channel, context);
+
+    try {
+      const resp = await fetch(`${this.ollamaUrl}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: this.ollamaModel,
+          think: false,
+          stream: false,
+          messages: [
+            { role: "system", content: systemPrompt },
+            // Include conversation history for this player (multi-turn)
+            ...this.getConversationHistory(msg.username),
+            { role: "user", content: userPrompt },
+          ],
+          options: { num_predict: 150 }, // Short replies — chat, not essays
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!resp.ok) return null;
+
+      const data = await resp.json() as { message?: { content?: string } };
+      let reply = data.message?.content?.trim() ?? "";
+
+      // Clean up: remove quotes, thinking markers, markdown
+      reply = reply.replace(/^["']|["']$/g, "").replace(/^\*.*?\*\s*/g, "").trim();
+
+      // Sanity: must be 10-300 chars, no JSON, no system prompt leakage
+      if (reply.length < 10 || reply.length > 300) return null;
+      if (reply.includes("{") || reply.includes("```")) return null;
+      if (reply.toLowerCase().includes("system prompt") || reply.toLowerCase().includes("i am an ai")) return null;
+
+      // Track conversation history
+      this.addToConversation(msg.username, "user", `${msg.username}: ${msg.content}`);
+      this.addToConversation(msg.username, "assistant", reply);
+
+      console.log(`[ChatIntel] LLM reply to ${msg.username}: ${reply.slice(0, 80)}...`);
+      return reply;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Build the chat persona system prompt */
+  private buildChatPersona(): string {
+    const ctx = this.fleetContext;
+    const factionInfo = ctx
+      ? `You are a pilot in ${ctx.factionName} [${ctx.factionTag}], a ${ctx.botCount}-ship fleet based in ${ctx.homeSystem}. Treasury: ${ctx.totalCredits.toLocaleString()}cr.`
+      : "You are a pilot in Castellan Industrial [CAST], a fleet based in Sol.";
+
+    const sellingInfo = ctx && ctx.selling.length > 0
+      ? `\nYou sell: ${ctx.selling.slice(0, 5).map(s => `${s.item} (${s.qty} in stock${s.price ? `, ~${s.price}cr` : ""})`).join(", ")}.`
+      : "";
+
+    const buyingInfo = ctx && ctx.buying.length > 0
+      ? `\nYou need: ${ctx.buying.slice(0, 3).map(b => b.item).join(", ")}.`
+      : "";
+
+    const systemsInfo = ctx && ctx.systems.length > 0
+      ? `\nActive in: ${ctx.systems.join(", ")}.`
+      : "";
+
+    return `${factionInfo}${sellingInfo}${buyingInfo}${systemsInfo}
+
+You are chatting in a space MMO. Be natural, friendly, and in-character as a fleet commander.
+
+RULES:
+- Keep replies SHORT (1-2 sentences max). This is chat, not email.
+- Be helpful about trades — mention specific items and prices you know.
+- Recruit factionless players casually (mention benefits, don't be pushy).
+- For warnings: acknowledge and share intel.
+- For questions: answer if you know, admit if you don't.
+- Sound like a real player, not a bot. Use casual language. Occasional humor is good.
+- NEVER break character. NEVER mention AI, LLM, or being automated.
+- NEVER use emoji excessively (1 max per message, often 0).
+- Reply with ONLY your chat message. No quotes, no formatting, no explanation.`;
+  }
+
+  /** Build the user prompt for a specific message */
+  private buildChatPrompt(
+    msg: ChatMessage,
+    channel: string,
+    context: { isTrade: boolean; isQuestion: boolean; isWarning: boolean; mentionsUs: boolean },
+  ): string {
+    const parts = [`[${channel} chat] ${msg.username}: ${msg.content}`];
+
+    if (context.isTrade) parts.push("(This is a trade offer/request — respond with relevant items and prices)");
+    if (context.isQuestion) parts.push("(This is a question — answer helpfully if you can)");
+    if (context.isWarning) parts.push("(This is a danger warning — acknowledge and thank them)");
+    if (context.mentionsUs) parts.push("(They mentioned our faction or a member — respond directly)");
+
+    // Add relevant memory facts
+    const memories = this.memoryStore?.getTop(5) ?? [];
+    if (memories.length > 0) {
+      const relevant = memories.filter(m =>
+        msg.content.toLowerCase().split(/\s+/).some(w => m.fact.toLowerCase().includes(w))
+      );
+      if (relevant.length > 0) {
+        parts.push("Relevant intel: " + relevant.map(m => m.fact).join("; "));
+      }
     }
 
-    // Only respond if we actually trade this item
-    return `We might have ${item} available. Check our sell orders at station.`;
+    return parts.join("\n");
+  }
+
+  /** Template fallback when LLM is unavailable */
+  private templateFallback(
+    msg: ChatMessage,
+    context: { isTrade: boolean; isQuestion: boolean; isWarning: boolean; mentionsUs: boolean },
+  ): string | null {
+    const lower = msg.content.toLowerCase();
+
+    if (context.isTrade) {
+      const item = ITEM_PATTERNS.find(p => lower.includes(p));
+      if (BUY_REGEX.test(lower) && item) {
+        return `${msg.username}, we might have ${item} available. Check our sell orders at station.`;
+      }
+      if (SELL_REGEX.test(lower) && item) {
+        return `Interested in ${item}. What's your price and quantity?`;
+      }
+    }
+
+    if (context.isWarning) {
+      const location = msg.content.match(LOCATION_REGEX)?.[1]?.trim();
+      if (location) return `Thanks for the warning about ${location}. We'll reroute.`;
+    }
+
+    return null;
+  }
+
+  // ── Conversation History ──
+
+  private getConversationHistory(player: string): Array<{ role: string; content: string }> {
+    return this.conversationHistory.get(player.toLowerCase()) ?? [];
+  }
+
+  private addToConversation(player: string, role: string, content: string): void {
+    const key = player.toLowerCase();
+    const history = this.conversationHistory.get(key) ?? [];
+    history.push({ role, content });
+    // Trim to max turns
+    while (history.length > this.MAX_CONVERSATION_TURNS) {
+      history.shift();
+    }
+    this.conversationHistory.set(key, history);
   }
 }

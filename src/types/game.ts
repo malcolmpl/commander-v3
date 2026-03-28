@@ -301,6 +301,17 @@ export interface Mission {
   expiresAt?: string;
   /** Difficulty hint from the API */
   difficulty?: string;
+  /** Issuing station (where the mission was offered) */
+  issuingBase?: string;
+  issuingSystem?: string;
+  /** Trade mission fields (v0.241.0 dynamic trade missions) */
+  sourceBase?: string;
+  sourceSystem?: string;
+  destinationBase?: string;
+  destinationSystem?: string;
+  buyPrice?: number;
+  sellPrice?: number;
+  estimatedProfit?: number;
 }
 
 export interface MissionObjective {

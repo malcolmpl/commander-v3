@@ -260,6 +260,32 @@ export function handleClientMessage(
         break;
       }
 
+      case "update_ai_settings" as any: {
+        const ai = (msg as any).settings as Record<string, unknown>;
+        const updates: Record<string, unknown> = {};
+        if (ai.ollamaModel !== undefined) {
+          const model = String(ai.ollamaModel).slice(0, 100);
+          if (model) updates.ollamaModel = model;
+        }
+        if (ai.ollamaBaseUrl !== undefined) {
+          const url = String(ai.ollamaBaseUrl).slice(0, 200);
+          if (url) updates.ollamaBaseUrl = url;
+        }
+        if (ai.timeoutMs !== undefined) {
+          const n = Number(ai.timeoutMs);
+          if (!isNaN(n) && n >= 5000 && n <= 120000) updates.timeoutMs = n;
+        }
+        if (Object.keys(updates).length > 0) {
+          commander.updateAiSettings(updates as any);
+          const current = commander.getAiSettings();
+          if (current) {
+            broadcast({ type: "ai_settings_update", settings: current } as any);
+          }
+          broadcast({ type: "notification", level: "info", title: "AI settings updated", message: `Ollama model: ${updates.ollamaModel ?? "unchanged"}` });
+        }
+        break;
+      }
+
       case "update_bot_settings": {
         const bot = botManager.getBot(msg.botId);
         if (bot) {

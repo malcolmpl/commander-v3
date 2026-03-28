@@ -5,6 +5,7 @@
 
 import type { Recipe, CatalogItem, ShipState, CargoItem } from "../types/game";
 import type { Cargo } from "./cargo";
+import { STRATEGIC_RESOURCES } from "../config/constants";
 
 export interface CraftingPlan {
   recipeId: string;
@@ -566,7 +567,47 @@ export class Crafting {
       // before crafting higher-tier items that consume refined goods
       const allInputsRaw = recipe.ingredients.every(ing => this.isRawMaterial(ing.itemId));
       const refiningBoost = allInputsRaw ? 1.5 : 1.0;
-      const score = profit * (avail * avail) * refiningBoost;
+      // Intermediate ingredients used by many recipes are strategically valuable
+      const usageCount = this.recipes.reduce((count, r) =>
+        count + (r.ingredients.some(ing => ing.itemId === recipe.outputItem) ? 1 : 0), 0);
+      const intermediateBoost = usageCount > 2 ? 2.0 : 1.0;
+
+      // Surplus consumption bonus: if recipe inputs are overstocked in faction storage,
+      // add a flat bonus so we convert dead inventory into sellable goods even at low profit.
+      // ONLY applies when the output has confirmed market demand (sellPrice > 0 at some station)
+      // or is an intermediate ingredient — prevents crafting unsellable waste like purified water.
+      let surplusBonus = 0;
+      const outputSellPrice = this.marketPrices?.getSellPrice(recipe.outputItem) ?? 0;
+      const outputHasDemand = outputSellPrice > 0 || usageCount > 0; // Buyers exist, or it's an ingredient
+      if (outputHasDemand) {
+        for (const ing of recipe.ingredients) {
+          const stock = inventory.get(ing.itemId) ?? 0;
+          if (stock > 20000) surplusBonus += 200;      // Extreme surplus — must consume
+          else if (stock > 10000) surplusBonus += 150;  // Heavy surplus
+          else if (stock > 5000) surplusBonus += 80;    // Major surplus
+          else if (stock > 1000) surplusBonus += 20;    // Moderate surplus
+        }
+      }
+
+      // Strategic resource bonus: if recipe output is a strategic resource below minStock, boost priority
+      let strategicBonus = 0;
+      const stratRes = STRATEGIC_RESOURCES.find(sr => sr.itemId === recipe.outputItem);
+      if (stratRes) {
+        const currentStock = inventory.get(recipe.outputItem) ?? 0;
+        if (currentStock < stratRes.minStock) strategicBonus = 100;
+      }
+
+      const effectiveProfit = Math.max(profit, 1) + surplusBonus + strategicBonus; // Floor at 1 to prevent 0 × anything = 0
+
+      // Efficiency multiplier: prefer recipes that produce more output per input unit.
+      // e.g., Refine Steel (5 iron → 2 steel, eff=0.40) beats Basic Iron Smelting (10 iron → 1 steel, eff=0.10)
+      // Fluorine Nano-Etch (2 silicon + 1 fluorine → 5 circuit boards) beats Fabricate (3 copper + 2 silicon + 1 crystal → 2)
+      const totalInputQty = recipe.ingredients.reduce((sum, ing) => sum + ing.quantity, 0);
+      const efficiencyBoost = totalInputQty > 0 ? recipe.outputQuantity / totalInputQty : 1;
+      // Normalize: eff of 0.1-0.5 is typical, boost range ~0.5x to 2.0x
+      const efficiencyMultiplier = Math.max(0.5, Math.min(2.0, efficiencyBoost * 3));
+
+      const score = effectiveProfit * (avail * avail) * refiningBoost * intermediateBoost * efficiencyMultiplier;
 
       if (score > bestScore) {
         bestScore = score;

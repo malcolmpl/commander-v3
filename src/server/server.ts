@@ -7,8 +7,8 @@ import type { ServerWebSocket } from "bun";
 import type { ServerMessage, ClientMessage } from "../types/protocol";
 import type { DB } from "../data/db";
 import type { TrainingLogger } from "../data/training-logger";
-import { gt, desc } from "drizzle-orm";
-import { creditHistory, marketHistory, activityLog, commanderLog as commanderLogTable, factionTransactions } from "../data/schema";
+import { gt, desc, sql } from "drizzle-orm";
+import { creditHistory, marketHistory, activityLog, commanderLog as commanderLogTable, factionTransactions, financialEvents } from "../data/schema";
 
 const RANGE_MS: Record<string, number> = {
   "1h": 60 * 60 * 1000,
@@ -176,6 +176,14 @@ async function handleApiRoute(url: URL, opts: ServerOptions): Promise<Response> 
     return handleFactionTransactionsRoute(url, opts.db);
   }
 
+  if (path === "economy/bot-breakdown" && opts.db) {
+    return handleBotBreakdownRoute(url, opts.db);
+  }
+
+  if (path === "economy/mining-rate" && opts.db) {
+    return handleMiningRateRoute(url, opts.db);
+  }
+
   return Response.json({ error: "Not found" }, { status: 404 });
 }
 
@@ -339,4 +347,81 @@ function handleFactionTransactionsRoute(url: URL, db: DB): Response {
       details: r.details,
     }))
   );
+}
+
+/** GET /api/economy/bot-breakdown?range=1d — revenue/cost per bot */
+function handleBotBreakdownRoute(url: URL, db: DB): Response {
+  const range = url.searchParams.get("range") ?? "1d";
+  const ms = RANGE_MS[range] ?? RANGE_MS["1d"];
+  const since = Date.now() - ms;
+
+  const rows = db.all(sql`
+    SELECT
+      ${financialEvents.botId} as bot_id,
+      SUM(CASE WHEN ${financialEvents.eventType} = 'revenue' THEN ${financialEvents.amount} ELSE 0 END) as revenue,
+      SUM(CASE WHEN ${financialEvents.eventType} = 'cost' THEN ${financialEvents.amount} ELSE 0 END) as cost
+    FROM ${financialEvents}
+    WHERE ${financialEvents.timestamp} >= ${since}
+    GROUP BY ${financialEvents.botId}
+    ORDER BY revenue DESC
+  `) as Array<{ bot_id: string | null; revenue: number; cost: number }>;
+
+  return Response.json(
+    rows.filter(r => r.bot_id).map(r => ({
+      botId: r.bot_id,
+      revenue: r.revenue ?? 0,
+      cost: r.cost ?? 0,
+    }))
+  );
+}
+
+/** GET /api/economy/mining-rate?range=1d — ore mined per hour, by ore type and by bot */
+function handleMiningRateRoute(url: URL, db: DB): Response {
+  const range = url.searchParams.get("range") ?? "1d";
+  const ms = RANGE_MS[range] ?? RANGE_MS["1d"];
+  const since = Date.now() - ms;
+
+  const rows = db.select({
+    timestamp: activityLog.timestamp,
+    botId: activityLog.botId,
+    message: activityLog.message,
+  }).from(activityLog)
+    .where(gt(activityLog.timestamp, since))
+    .all()
+    .filter(r => r.message?.includes("miner: mined") || r.message?.includes("harvester: harvested"));
+
+  // Parse quantities and bucket by hour — now tracks by ore type too
+  const bucketMs = 3_600_000; // 1 hour
+  const buckets = new Map<number, { total: number; byBot: Record<string, number>; byOre: Record<string, number> }>();
+
+  for (const r of rows) {
+    // Match patterns like "miner: mined 5 carbon_ore" or "harvester: harvested 3 hydrogen"
+    const match = r.message?.match(/(?:mined|harvested)\s+(\d+)\s+(\S+)/);
+    if (!match) continue;
+    const qty = parseInt(match[1], 10);
+    if (isNaN(qty)) continue;
+    const oreType = match[2]; // e.g. "iron_ore", "carbon_ore", "hydrogen"
+
+    const hour = Math.floor(r.timestamp / bucketMs) * bucketMs;
+    let bucket = buckets.get(hour);
+    if (!bucket) {
+      bucket = { total: 0, byBot: {}, byOre: {} };
+      buckets.set(hour, bucket);
+    }
+    bucket.total += qty;
+    const botId = r.botId ?? "unknown";
+    bucket.byBot[botId] = (bucket.byBot[botId] ?? 0) + qty;
+    bucket.byOre[oreType] = (bucket.byOre[oreType] ?? 0) + qty;
+  }
+
+  const result = [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([hour, data]) => ({
+      hour,
+      total: data.total,
+      byBot: data.byBot,
+      byOre: data.byOre,
+    }));
+
+  return Response.json(result);
 }

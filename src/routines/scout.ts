@@ -26,6 +26,9 @@ import {
   cacheMarketData,
   getParam,
   interruptibleSleep,
+  fleetViewMarket,
+  fleetGetSystem,
+  fleetViewFactionStorage,
 } from "./helpers";
 
 /**
@@ -54,9 +57,8 @@ async function* scanSystemStations(
       yield `current station freshly cached (${Math.round((Date.now() - freshness.fetchedAt) / 1000)}s ago)`;
     } else if (!freshness.fresh) {
       try {
-        const market = await ctx.api.viewMarket();
+        const market = await fleetViewMarket(ctx, ctx.player.dockedAtBase);
         if (market.length > 0) {
-          cacheMarketData(ctx, ctx.player.dockedAtBase, market);
           yield `scanned ${market.length} orders at current station`;
           scanned++;
         } else {
@@ -74,7 +76,7 @@ async function* scanSystemStations(
 
   // Find and scan other stations in this system
   try {
-    const system = await ctx.api.getSystem();
+    const system = await fleetGetSystem(ctx);
     const otherBases = system.pois.filter(
       (p) => p.hasBase && p.baseId && p.baseId !== ctx.player.dockedAtBase
     );
@@ -91,9 +93,8 @@ async function* scanSystemStations(
       try {
         yield `scanning ${poi.baseName ?? poi.name}`;
         await navigateAndDock(ctx, poi.baseId!);
-        const market = await ctx.api.viewMarket();
+        const market = await fleetViewMarket(ctx, poi.baseId!);
         if (market.length > 0) {
-          cacheMarketData(ctx, poi.baseId!, market);
           yield `scanned ${market.length} orders at ${poi.baseName ?? poi.name}`;
           scanned++;
         }
@@ -167,6 +168,27 @@ export async function* scout(ctx: BotContext): AsyncGenerator<RoutineYield, void
       if (ctx.player.currentSystem === targetSystem) {
         yield `[${loopCount}] already in ${targetSystem}`;
       } else {
+        // Fuel gate: ensure enough fuel to reach target AND return to a station
+        const fuelPerJump = ctx.nav.estimateJumpFuel(ctx.ship);
+        const currentSys = ctx.player.currentSystem ?? "";
+        const distToTarget = ctx.galaxy.getDistance(currentSys, targetSystem);
+        if (distToTarget > 0) {
+          // Reserve fuel for return to home system (or at least same distance back)
+          const homeSystem = ctx.fleetConfig.homeSystem ?? currentSys;
+          const distHome = ctx.galaxy.getDistance(targetSystem, homeSystem);
+          const returnDist = Math.max(1, distHome > 0 ? distHome : distToTarget);
+          const fuelNeeded = (distToTarget + returnDist) * fuelPerJump + 3;
+          if (ctx.ship.fuel < fuelNeeded) {
+            // If fuel is too low for ANY remaining system, end patrol early
+            if (ctx.ship.fuel < fuelPerJump * 3) {
+              yield `fuel too low to continue patrol (${ctx.ship.fuel} fuel) — ending loop`;
+              break;
+            }
+            yield `[${loopCount}] skipping ${targetSystem}: insufficient fuel (need ~${Math.ceil(fuelNeeded)}, have ${ctx.ship.fuel})`;
+            continue;
+          }
+        }
+
         yield `[${loopCount}] traveling to ${targetSystem}`;
         try {
           await navigateTo(ctx, targetSystem);
@@ -215,7 +237,7 @@ export async function* scout(ctx: BotContext): AsyncGenerator<RoutineYield, void
         } catch { /* non-critical */ }
 
         try {
-          const storage = await ctx.api.viewFactionStorageFull();
+          const storage = await fleetViewFactionStorage(ctx);
           yield `faction storage: ${storage.items.length} items, ${storage.credits} credits`;
           if ((storage.items.length > 0 || storage.credits > 0) && ctx.player.dockedAtBase) {
             if (!ctx.fleetConfig.factionStorageStation) {

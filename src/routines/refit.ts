@@ -24,6 +24,7 @@ import {
   getParam,
   withdrawFromFaction,
   canFitModule,
+  fleetViewFactionStorage,
 } from "./helpers";
 import { getModulesForRole } from "../commander/roles";
 
@@ -94,7 +95,8 @@ export async function* refit(ctx: BotContext): AsyncGenerator<RoutineYield, void
   // Step 3: Load faction storage
   let factionStorage: Array<{ itemId: string; quantity: number }> = [];
   try {
-    factionStorage = await ctx.api.viewFactionStorage() ?? [];
+    const factionData = await fleetViewFactionStorage(ctx);
+    factionStorage = factionData.items.filter(i => i.quantity > 0);
   } catch { /* proceed without faction storage */ }
 
   if (ctx.shouldStop) return;
@@ -112,6 +114,7 @@ export async function* refit(ctx: BotContext): AsyncGenerator<RoutineYield, void
       if (inCargo > 0) {
         try {
           await ctx.api.factionDepositItems(modId, inCargo);
+          ctx.cache.invalidateFactionStorage();
           await ctx.refreshState();
         } catch { /* best effort */ }
       }
@@ -147,6 +150,7 @@ export async function* refit(ctx: BotContext): AsyncGenerator<RoutineYield, void
         if (inCargo > 0) {
           try {
             await ctx.api.factionDepositItems(mod.moduleId, inCargo);
+            ctx.cache.invalidateFactionStorage();
             await ctx.refreshState();
           } catch { /* best effort */ }
         }
@@ -242,6 +246,7 @@ export async function* refit(ctx: BotContext): AsyncGenerator<RoutineYield, void
         if (inCargo > 0) {
           try {
             await ctx.api.factionDepositItems(mod.moduleId, inCargo);
+            ctx.cache.invalidateFactionStorage();
             await ctx.refreshState();
             // Update local tracking
             const storageEntry = factionStorage.find(s => s.itemId === mod.moduleId);
@@ -288,6 +293,7 @@ export async function* refit(ctx: BotContext): AsyncGenerator<RoutineYield, void
         // Deposit back to faction storage if install fails
         try {
           await ctx.api.factionDepositItems(sourceItemId, 1);
+          ctx.cache.invalidateFactionStorage();
           await ctx.refreshState();
         } catch { /* best effort */ }
         if (msg.includes("cpu") || msg.includes("power") || msg.includes("slot")) {
@@ -345,6 +351,7 @@ export async function* refit(ctx: BotContext): AsyncGenerator<RoutineYield, void
             // Deposit back
             try {
               await ctx.api.factionDepositItems(mod.itemId, 1);
+              ctx.cache.invalidateFactionStorage();
               await ctx.refreshState();
               mod.quantity++;
             } catch { /* best effort */ }
@@ -383,6 +390,7 @@ export async function* refit(ctx: BotContext): AsyncGenerator<RoutineYield, void
             // Deposit to faction storage if install fails
             try {
               await ctx.api.factionDepositItems(order.itemId, 1);
+              ctx.cache.invalidateFactionStorage();
               await ctx.refreshState();
             } catch { /* best effort */ }
             if (msg.includes("cpu") || msg.includes("power") || msg.includes("slot")) {
@@ -414,7 +422,7 @@ export async function* refit(ctx: BotContext): AsyncGenerator<RoutineYield, void
               continue;
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
-              try { await ctx.api.factionDepositItems(remote.itemId, 1); await ctx.refreshState(); } catch { /* best effort */ }
+              try { await ctx.api.factionDepositItems(remote.itemId, 1); ctx.cache.invalidateFactionStorage(); await ctx.refreshState(); } catch { /* best effort */ }
               if (msg.includes("cpu") || msg.includes("power") || msg.includes("slot")) {
                 yield `ship slots full — ${msg}`;
                 break;

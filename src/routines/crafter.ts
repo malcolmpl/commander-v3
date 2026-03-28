@@ -34,6 +34,7 @@ import {
   interruptibleSleep,
   isProtectedItem,
   withdrawFromFaction,
+  fleetViewFactionStorage,
   MAX_MATERIAL_BUY_PRICE,
 } from "./helpers";
 
@@ -60,7 +61,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
   // Fetch faction storage inventory for material-aware recipe selection
   let factionInventory = new Map<string, number>();
   try {
-    const storage = await ctx.api.viewFactionStorageFull();
+    const storage = await fleetViewFactionStorage(ctx);
     for (const item of storage.items) {
       factionInventory.set(item.itemId, (factionInventory.get(item.itemId) ?? 0) + item.quantity);
     }
@@ -84,7 +85,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
     if (!recipeId) {
       // Priority 1: craft something immediately from cargo
       const immediate = ctx.crafting.findCraftableNow(ctx.ship, ctx.player.skills);
-      if (immediate && !facilityOnlyRecipes.has(immediate.id)) {
+      if (immediate && !facilityOnlyRecipes.has(immediate.id) && !ctx.cache.isRecipeNoDemand(immediate.id)) {
         recipeId = immediate.id;
         const { profit, hasMarketData } = ctx.crafting.estimateMarketProfit(immediate.id);
         yield `ready to craft: ${immediate.name} (est. profit ${profit}cr${hasMarketData ? " mkt" : ""})`;
@@ -94,7 +95,10 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
     // Priority 2: find the best recipe we can source from faction storage
     // Loop to skip recipes blocked by unavailable materials
     for (let attempt = 0; !recipeId && attempt < 20; attempt++) {
-      const excludeIds = new Set([...facilityOnlyRecipes, ...failedRecipes]);
+      // Exclude facility-only, locally failed, and globally-flagged no-demand recipes
+      const allRecipeIds = ctx.crafting.getAllRecipes().map(r => r.id);
+      const globalNoDemand = allRecipeIds.filter(id => ctx.cache.isRecipeNoDemand(id));
+      const excludeIds = new Set([...facilityOnlyRecipes, ...failedRecipes, ...globalNoDemand]);
       const sourced = ctx.crafting.findBestSourceableRecipe(ctx.player.skills, factionInventory, excludeIds);
       if (!sourced) {
         if (failedRecipes.size > 0) {
@@ -155,6 +159,15 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
   let noSellCount = 0; // Track consecutive no-demand cycles — bail after 3 to avoid infinite loops
 
   while (!ctx.shouldStop) {
+    // ── Sync material blacklist with cache TTLs (expired entries = retry) ──
+    const currentBlacklist = ctx.cache.getUnavailableMaterials(ctx.botId);
+    const currentSet = new Set(currentBlacklist);
+    for (const mat of unavailableMaterials) {
+      if (!currentSet.has(mat)) {
+        unavailableMaterials.delete(mat); // TTL expired in cache → allow retry
+      }
+    }
+
     // ── Clear leftover cargo from previous failed cycles ──
     // Without this, intermediates and materials pile up until cargo is 100% full,
     // blocking all future sourcing and crafting (infinite stuck loop).
@@ -210,7 +223,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
         ctx.cache.markRecipeFailed(recipeId);
         failedRecipes.add(recipeId);
         recipeId = "";
-        await interruptibleSleep(ctx, 30_000);
+        await interruptibleSleep(ctx, 10_000);
         yield typedYield("cycle_complete", { type: "cycle_complete", botId: ctx.botId, routine: "crafter" });
         continue;
       }
@@ -309,12 +322,12 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
       failedRecipes.add(recipeId);
       yield `chain failed (${failedRecipes.size} blocked) — finding alternative recipe`;
       recipeId = "";
-      await interruptibleSleep(ctx, 60_000);
+      await interruptibleSleep(ctx, 15_000);
 
       // Re-discover recipe using material availability (refresh faction inventory)
       try {
         factionInventory = new Map<string, number>();
-        const storage = await ctx.api.viewFactionStorageFull();
+        const storage = await fleetViewFactionStorage(ctx);
         for (const item of storage.items) {
           factionInventory.set(item.itemId, (factionInventory.get(item.itemId) ?? 0) + item.quantity);
         }
@@ -365,6 +378,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
       if (qty > 0) {
         try {
           await ctx.api.factionDepositItems(recipe.outputItem, qty);
+          ctx.cache.invalidateFactionStorage();
           await ctx.refreshState();
           yield `deposited ${qty} ${ctx.crafting.getItemName(recipe.outputItem)} to faction (facility build material)`;
         } catch (err) {
@@ -376,6 +390,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
       const result = await sellItem(ctx, recipe.outputItem);
       if (result && result.total > 0) {
         noSellCount = 0; // Reset — demand exists
+        ctx.cache.clearRecipeNoDemand(recipe.id); // Clear global no-demand flag
         yield `sold ${result.quantity} ${recipe.outputItem} @ ${result.priceEach}cr (total: ${result.total}cr)`;
         // Record sell as demand signal for arbitrage
         if (ctx.player.dockedAtBase) {
@@ -391,6 +406,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
         if (unsoldQty > 0) {
           try {
             await ctx.api.factionDepositItems(recipe.outputItem, unsoldQty);
+            ctx.cache.invalidateFactionStorage();
             await ctx.refreshState();
             yield `no demand — deposited ${unsoldQty} ${ctx.crafting.getItemName(recipe.outputItem)} to faction storage`;
           } catch {
@@ -404,6 +420,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
         }
         // Track consecutive no-demand cycles — bail after 3 to avoid infinite algae loops
         noSellCount++;
+        ctx.cache.markRecipeNoDemand(recipe.id); // Global flag so other crafters skip this recipe too
         if (noSellCount >= 3) {
           yield `stopping: ${noSellCount} consecutive cycles with no demand for ${ctx.crafting.getItemName(recipe.outputItem)}`;
           return;
@@ -419,6 +436,7 @@ export async function* crafter(ctx: BotContext): AsyncGenerator<RoutineYield, vo
           // Deposit to faction storage
           try {
             await ctx.api.factionDepositItems(recipe.outputItem, qty);
+            ctx.cache.invalidateFactionStorage();
             await ctx.refreshState();
             yield `deposited ${qty} ${ctx.crafting.getItemName(recipe.outputItem)} to faction storage`;
           } catch (err) {
@@ -584,7 +602,7 @@ async function sourceMaterials(
       // Don't blacklist for transient failures (rate limiting, cargo full, action_in_progress)
       let isTrulyMissing = true;
       try {
-        const storage = await ctx.api.viewFactionStorageFull();
+        const storage = await fleetViewFactionStorage(ctx);
         const inStorage = storage.items.find(i => i.itemId === ing.itemId);
         if (inStorage && inStorage.quantity >= shortfall) {
           isTrulyMissing = false; // Material exists — failure was transient
@@ -625,6 +643,7 @@ async function* clearCrafterCargo(
 
     try {
       await ctx.api.factionDepositItems(item.itemId, item.quantity);
+      ctx.cache.invalidateFactionStorage();
       deposited += item.quantity;
     } catch (err) {
       console.warn(`[${ctx.botId}] faction deposit failed for ${item.itemId}: ${err instanceof Error ? err.message : err}`);

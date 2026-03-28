@@ -181,6 +181,7 @@ export const financialEvents = sqliteTable("financial_events", {
   eventType: text("event_type").notNull(),
   amount: real("amount").notNull(),
   botId: text("bot_id"),
+  source: text("source"),
 }, (table) => [
   index("idx_financial_ts").on(table.timestamp),
   index("idx_financial_type").on(table.eventType),
@@ -281,3 +282,32 @@ export const commanderMemory = sqliteTable("commander_memory", {
   importance: integer("importance").notNull().default(5),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 });
+
+// ── Bot Skills (persisted skill snapshots) ──
+
+export const botSkills = sqliteTable("bot_skills", {
+  username: text("username").primaryKey(),
+  skills: text("skills").notNull(),
+  updatedAt: text("updated_at").default(sql`(datetime('now'))`),
+});
+
+// ── Outcome Embeddings (semantic memory for strategic decisions) ──
+
+export const outcomeEmbeddings = sqliteTable("outcome_embeddings", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  /** Human-readable description of the outcome */
+  text: text("text").notNull(),
+  /** Serialized float32 embedding vector from nomic-embed-text */
+  embedding: text("embedding").notNull(),
+  /** Category: trade_outcome, mine_outcome, craft_outcome, market_intel, strategic */
+  category: text("category").notNull(),
+  /** Structured metadata (JSON: item, profit, route, system, etc.) */
+  metadata: text("metadata").notNull().default("{}"),
+  /** Credit impact of this outcome (positive = profitable) */
+  profitImpact: real("profit_impact"),
+  createdAt: text("created_at").default(sql`(datetime('now'))`),
+}, (table) => [
+  index("idx_embed_category").on(table.category),
+  index("idx_embed_created").on(table.createdAt),
+  index("idx_embed_profit").on(table.profitImpact),
+]);

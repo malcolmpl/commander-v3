@@ -14,6 +14,7 @@ import type { BotContext } from "../bot/types";
 import type { RoutineYield } from "../events/types";
 import { typedYield } from "../events/types";
 import {
+  navigateTo,
   navigateToPoi,
   navigateAndDock,
   findAndDock,
@@ -21,6 +22,7 @@ import {
   repairIfNeeded,
   disposeCargo,
   depositItem,
+  sellItem,
   handleEmergency,
   safetyCheck,
   getParam,
@@ -29,6 +31,8 @@ import {
   ensureMinCredits,
   depositExcessCredits,
   equipModulesForRoutine,
+  fleetGetSystem,
+  fleetGetPoi,
 } from "./helpers";
 
 export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void, void> {
@@ -74,7 +78,7 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
   if (!targetBelt || !sellStation) {
     yield "discovering targets...";
     try {
-      const system = await ctx.api.getSystem();
+      const system = await fleetGetSystem(ctx);
       // Find a mineable POI - filter by equipped modules
       if (!targetBelt) {
         const hasIceHarvester = ctx.ship.modules.some((m) =>
@@ -131,46 +135,82 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
       ...ctx.galaxy.findPoisByType("nebula"),
     ].filter(b => !ctx.galaxy.isPoiDepleted(b.poi.id));
 
-    // Cold-start: galaxy cache empty — bootstrap from API map
+    // Cold-start: galaxy cache has no POI data — scan connected systems to discover belts
     if (allBelts.length === 0) {
-      yield "galaxy cache cold — fetching map...";
+      yield `galaxy cache cold (${ctx.galaxy.systemCount} systems, ${ctx.galaxy.poiCount} POIs) — scanning connected systems...`;
       try {
-        const systems = await ctx.cache.getMap(ctx.api);
-        for (const sys of systems) ctx.galaxy.updateSystem(sys);
+        // Ensure map is loaded for connection graph
+        if (ctx.galaxy.systemCount < 50) {
+          const systems = await ctx.cache.getMap(ctx.api);
+          for (const sys of systems) ctx.galaxy.updateSystem(sys);
+        }
+        // Get current system's connections and scan each for POI data
+        const currentSysId = ctx.player.currentSystem;
+        const currentSysData = currentSysId ? ctx.galaxy.getSystem(currentSysId) : null;
+        const neighbors = currentSysData?.connections ?? [];
+        // Check cached system details for neighbors (free — no API call)
+        for (const neighborId of neighbors) {
+          const cached = ctx.cache.getSystemDetail(neighborId);
+          if (cached && cached.pois.length > 0) {
+            ctx.galaxy.updateSystem(cached);
+          }
+        }
         allBelts = [
           ...ctx.galaxy.findPoisByType("asteroid_belt"),
           ...ctx.galaxy.findPoisByType("asteroid"),
           ...ctx.galaxy.findPoisByType("nebula"),
         ].filter(b => !ctx.galaxy.isPoiDepleted(b.poi.id));
-        yield `map loaded: ${systems.length} systems, ${allBelts.length} belts found`;
+        yield `neighbor scan: ${allBelts.length} belts found from cached data`;
       } catch (err) {
-        yield `map fetch failed: ${err instanceof Error ? err.message : String(err)}`;
+        yield `neighbor scan failed: ${err instanceof Error ? err.message : String(err)}`;
       }
     }
-    // Sort by ROI: prefer belts with stations nearby (for selling) and short distance
-    // Belts in systems with a station score higher (no wasted travel to sell)
-    // crystal_miner role strongly prefers nebulae for energy/phase crystals
-    const isCrystalMiner = ctx.settings.role === "crystal_miner";
-    const botSystem = ctx.player.currentSystem;
-    if (botSystem) {
-      allBelts.sort((a, b) => {
-        const distA = ctx.galaxy.getDistance(botSystem, a.systemId);
-        const distB = ctx.galaxy.getDistance(botSystem, b.systemId);
-        const da = a.systemId === botSystem ? 0 : (distA < 0 ? 99 : distA);
-        const db = b.systemId === botSystem ? 0 : (distB < 0 ? 99 : distB);
-        // Bonus: system has a station (can sell without extra travel)
-        const sysA = ctx.galaxy.getSystem(a.systemId);
-        const sysB = ctx.galaxy.getSystem(b.systemId);
-        const hasStationA = sysA?.pois.some(p => p.hasBase) ? 0 : 2; // +2 jump penalty if no station
-        const hasStationB = sysB?.pois.some(p => p.hasBase) ? 0 : 2;
-        // Crystal miners get -10 distance bonus for nebulae (strongly prefer them)
-        const nebulaA = isCrystalMiner && a.poi.type === "nebula" ? -10 : 0;
-        const nebulaB = isCrystalMiner && b.poi.type === "nebula" ? -10 : 0;
-        return (da + hasStationA + nebulaA) - (db + hasStationB + nebulaB);
-      });
-    }
-    const nearestBelt = allBelts[0];
-    if (nearestBelt) {
+
+    // Select best belt from galaxy-wide data (Commander should handle exploration — don't travel blindly)
+    if (!targetBelt && allBelts.length > 0) {
+      // Sort by ROI: prefer belts with stations nearby (for selling) and short distance
+      // crystal_miner role strongly prefers nebulae for energy/phase crystals
+      const isCrystalMiner = ctx.settings.role === "crystal_miner";
+      const botSystem = ctx.player.currentSystem;
+      const fuelPerJump = ctx.nav.estimateJumpFuel(ctx.ship);
+
+      if (botSystem) {
+        // Filter out belts we can't reach with a round trip
+        allBelts = allBelts.filter(belt => {
+          if (belt.systemId === botSystem) return true; // Same system, no fuel needed
+          const dist = ctx.galaxy.getDistance(botSystem, belt.systemId);
+          if (dist < 0) return false; // Unknown route
+          const beltSys = ctx.galaxy.getSystem(belt.systemId);
+          const hasLocalStation = beltSys?.pois.some(p => p.hasBase) ?? false;
+          const returnPenalty = hasLocalStation ? 0 : 2; // Extra jumps if no local station
+          const roundTripFuel = (dist * 2 + returnPenalty) * fuelPerJump + 3; // +3 safety margin
+          return ctx.ship.fuel >= roundTripFuel;
+        });
+
+        allBelts.sort((a, b) => {
+          const distA = ctx.galaxy.getDistance(botSystem, a.systemId);
+          const distB = ctx.galaxy.getDistance(botSystem, b.systemId);
+          const da = a.systemId === botSystem ? 0 : (distA < 0 ? 99 : distA);
+          const db = b.systemId === botSystem ? 0 : (distB < 0 ? 99 : distB);
+          // Bonus: system has a station (can sell without extra travel)
+          const sysA = ctx.galaxy.getSystem(a.systemId);
+          const sysB = ctx.galaxy.getSystem(b.systemId);
+          const hasStationA = sysA?.pois.some(p => p.hasBase) ? 0 : 2; // +2 jump penalty if no station
+          const hasStationB = sysB?.pois.some(p => p.hasBase) ? 0 : 2;
+          // Crystal miners get -10 distance bonus for nebulae (strongly prefer them)
+          const nebulaA = isCrystalMiner && a.poi.type === "nebula" ? -10 : 0;
+          const nebulaB = isCrystalMiner && b.poi.type === "nebula" ? -10 : 0;
+          return (da + hasStationA + nebulaA) - (db + hasStationB + nebulaB);
+        });
+      }
+
+      if (allBelts.length === 0) {
+        yield `no reachable belts with current fuel (${ctx.ship.fuel} fuel, ~${fuelPerJump}/jump)`;
+        yield typedYield("cycle_complete", { type: "cycle_complete", botId: ctx.botId, routine: "miner" });
+        return;
+      }
+
+      const nearestBelt = allBelts[0];
       const currentSys = ctx.player.currentSystem ?? "unknown";
       yield `no mineable belt in ${currentSys} — traveling to ${nearestBelt.poi.name ?? nearestBelt.poi.id} in ${nearestBelt.systemId}`;
       try {
@@ -186,8 +226,8 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
         yield `failed to reach belt: ${err instanceof Error ? err.message : String(err)}`;
         return;
       }
-    } else {
-      yield `error: no mineable asteroid/ice/gas belt found in ${ctx.galaxy.systemCount} known systems (${ctx.player.currentSystem ?? "unknown"} has ${(await ctx.api.getSystem().catch(() => ({ pois: [] }))).pois.length} POIs)`;
+    } else if (!targetBelt) {
+      yield `error: no mineable asteroid/ice/gas belt found in ${ctx.galaxy.systemCount} known systems (${ctx.galaxy.poiCount} POIs indexed, ${ctx.player.currentSystem ?? "unknown"})`;
       return;
     }
   }
@@ -215,11 +255,11 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
 
     if (ctx.shouldStop) return;
 
-    // ── Scan POI resources and persist to cache ──
+    // ── Scan POI resources and persist to cache (fleet-deduped) ──
     try {
-      const poiDetail = await ctx.api.getPoi();
-      if (poiDetail.resources.length > 0) {
-        ctx.galaxy.updatePoiResources(targetBelt, poiDetail.resources);
+      const poiDetail = await fleetGetPoi(ctx, targetBelt);
+      if (poiDetail && poiDetail.resources.length > 0) {
+        // fleetGetPoi already calls updatePoiResources
       }
     } catch (err) {
       // Non-fatal: continue mining even if POI scan fails
@@ -287,12 +327,11 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
       yield "marked belt as depleted in galaxy data";
     }
 
-    // If belt depleted and we mined nothing, sell/deposit any existing cargo first
-    // then end cycle so Commander can reassign cleanly
+    // If belt depleted and we mined nothing, try to auto-select next belt
+    // to avoid 60s Commander reassignment delay
     const cargoAfterMining = ctx.ship.cargo.reduce((sum, c) => sum + c.quantity, 0);
     if (beltDepleted && cargoAfterMining <= cargoBeforeMining) {
-      yield "belt empty, requesting reassignment";
-      // Sell/deposit leftover cargo so next routine starts with space
+      // Sell/deposit leftover cargo first
       const hasNonFuelCargo = ctx.ship.cargo.some(
         (c) => c.itemId !== "fuel_cell" && c.quantity > 0,
       );
@@ -308,11 +347,34 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
             }
             await refuelIfNeeded(ctx);
           }
-        } catch (err) { /* best effort — log and continue to cycle_complete */
+        } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn(`[${ctx.botId}] leftover cargo disposal failed: ${msg}`);
         }
       }
+
+      // Auto-select next non-depleted belt instead of yielding cycle_complete
+      const nextBelts = [
+        ...ctx.galaxy.findPoisByType("asteroid_belt"),
+        ...ctx.galaxy.findPoisByType("ice_field"),
+        ...ctx.galaxy.findPoisByType("gas_cloud"),
+      ].filter(b => b.poi.id !== targetBelt && !ctx.galaxy.isPoiDepleted(b.poi.id));
+
+      if (nextBelts.length > 0) {
+        // Pick nearest non-depleted belt
+        const ranked = nextBelts
+          .map(b => ({ ...b, dist: ctx.galaxy.getDistance(ctx.player.currentSystem, b.systemId) }))
+          .filter(b => b.dist >= 0)
+          .sort((a, b) => a.dist - b.dist);
+        if (ranked.length > 0) {
+          targetBelt = ranked[0].poi.id;
+          yield `belt depleted, auto-switching to ${ranked[0].poi.name} (${ranked[0].dist} jumps)`;
+          continue; // Re-enter mining loop with new belt
+        }
+      }
+
+      // No belts available — fall back to cycle_complete
+      yield "belt empty, no alternatives — requesting reassignment";
       yield typedYield("cycle_complete", { type: "cycle_complete", botId: ctx.botId, routine: "miner" });
       return;
     }
@@ -359,6 +421,7 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
         try {
           if (mode === "faction_deposit") {
             await ctx.api.factionDepositItems(item.itemId, item.quantity);
+            ctx.cache.invalidateFactionStorage();
           } else {
             await depositItem(ctx, item.itemId);
           }
@@ -371,6 +434,34 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
           const msg = err instanceof Error ? err.message : String(err);
           yield `deposit failed for ${item.itemId}: ${msg}`;
           depositFailed = true;
+
+          // Storage cap exceeded (100k per ore type) — deposit to personal storage first (quiet), sell as fallback
+          if (msg.includes("cap") || msg.includes("full") || msg.includes("limit") || msg.includes("exceed")) {
+            try {
+              await ctx.api.depositItems(item.itemId, item.quantity);
+              await ctx.refreshState();
+              yield `${item.itemId} at faction cap — stashed in station storage`;
+              continue; // Skip to next item, don't error
+            } catch { /* station storage failed */ }
+            try {
+              const sold = await sellItem(ctx, item.itemId);
+              if (sold) {
+                yield `sold ${sold.quantity} ${item.itemId} @ ${sold.priceEach}cr (capped)`;
+              } else {
+                yield `${item.itemId} capped — no storage or buyers, skipping`;
+              }
+            } catch (sellErr) {
+              yield `sell failed for ${item.itemId}: ${sellErr instanceof Error ? sellErr.message : String(sellErr)}`;
+              // Last resort: deposit to personal station storage
+              try {
+                await depositItem(ctx, item.itemId);
+                yield `deposited ${item.quantity} ${item.itemId} to station storage`;
+              } catch {
+                yield `station deposit also failed for ${item.itemId}`;
+              }
+            }
+            continue; // Continue depositing other ore types
+          }
 
           // If error says "no_faction_storage", this station doesn't have the lockbox.
           // Try to find the right station via galaxy or API search.
@@ -437,9 +528,15 @@ export async function* miner(ctx: BotContext): AsyncGenerator<RoutineYield, void
                   if (isProtectedItem(item.itemId)) continue;
                   try {
                     await ctx.api.factionDepositItems(item.itemId, item.quantity);
+                    ctx.cache.invalidateFactionStorage();
                     yield `deposited ${item.quantity} ${item.itemId} to faction storage`;
                   } catch (err) {
-                    yield `faction deposit retry failed: ${err instanceof Error ? err.message : String(err)}`;
+                    const retryMsg = err instanceof Error ? err.message : String(err);
+                    yield `faction deposit retry failed: ${retryMsg}`;
+                    // Storage cap — skip this item, continue with others
+                    if (retryMsg.includes("cap") || retryMsg.includes("full") || retryMsg.includes("limit") || retryMsg.includes("exceed")) {
+                      continue;
+                    }
                     break;
                   }
                 }

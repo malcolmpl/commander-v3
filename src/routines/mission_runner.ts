@@ -34,11 +34,12 @@ import {
   ensureSystemDetail,
   getParam,
   payFactionTax,
+  fleetGetSystem,
 } from "./helpers";
 
 // ── Objective Classification ──
 
-type ObjectiveAction = "mine" | "deliver" | "travel" | "sell" | "craft" | "kill" | "survey" | "buy" | "collect" | "unknown";
+type ObjectiveAction = "mine" | "deliver" | "travel" | "sell" | "craft" | "kill" | "survey" | "buy" | "collect" | "trade" | "unknown";
 
 const ACTION_KEYWORDS: Record<ObjectiveAction, string[]> = {
   mine: ["mine", "extract", "harvest", "gather ore", "collect ore", "dig"],
@@ -50,6 +51,7 @@ const ACTION_KEYWORDS: Record<ObjectiveAction, string[]> = {
   survey: ["survey", "scan", "chart", "map", "analyze", "probe", "investigate"],
   buy: ["buy", "purchase", "acquire", "procure", "obtain from market"],
   collect: ["collect", "pick up", "retrieve", "salvage", "loot", "fetch"],
+  trade: ["trade route", "buy and sell", "buy at", "sell at", "trade mission"],
   unknown: [],
 };
 
@@ -58,7 +60,7 @@ const UNSAFE_MISSION_TYPES = new Set(["combat", "bounty", "assassination", "pira
 const UNSAFE_KEYWORDS = ["kill", "destroy", "defeat", "eliminate", "attack", "hunt", "bounty", "assassination"];
 
 // Objective types we can reliably complete (whitelist approach)
-const COMPLETABLE_ACTIONS: Set<ObjectiveAction> = new Set(["travel", "survey", "mine", "sell"]);
+const COMPLETABLE_ACTIONS: Set<ObjectiveAction> = new Set(["travel", "survey", "mine", "sell", "trade"]);
 // These CAN work but need profitability checks (item cost vs reward)
 const RISKY_ACTIONS: Set<ObjectiveAction> = new Set(["deliver", "buy", "collect", "craft"]);
 
@@ -73,6 +75,10 @@ const STRUCTURED_TYPE_MAP: Record<string, ObjectiveAction> = {
   craft_item: "craft",
   buy_item: "buy",
   survey_system: "survey",
+  trade: "trade",
+  trade_route: "trade",
+  buy_and_sell: "trade",
+  sell_item: "trade",
 };
 
 function classifyObjective(obj: MissionObjective): ObjectiveAction {
@@ -111,6 +117,27 @@ function isCombatMission(mission: Mission): boolean {
     if (classifyObjective(obj) === "kill") return true;
   }
 
+  return false;
+}
+
+/** Find the issuing base for a mission (where it was offered) */
+function findMissionIssuingBase(mission: Mission): string | undefined {
+  return mission.issuingBase;
+}
+
+/** Detect trade missions (v0.241.0 dynamic trade missions based on market supply/demand) */
+function isTradeTypeMission(mission: Mission): boolean {
+  // Explicit trade mission fields from API
+  if (mission.sourceBase && mission.destinationBase) return true;
+  if (mission.buyPrice != null && mission.sellPrice != null) return true;
+  // Type-based detection
+  const t = mission.type.toLowerCase();
+  if (t === "trade" || t === "trade_route" || t === "trading") return true;
+  // Keyword detection in title
+  const title = mission.title.toLowerCase();
+  if (title.includes("trade route") || title.includes("trade run") || title.includes("trade mission") || title.includes("buy and sell")) return true;
+  // Structural detection: has issuing base + sell_item objective at a different station
+  if (mission.issuingBase && mission.objectives.some(o => o.objectiveType === "sell_item")) return true;
   return false;
 }
 
@@ -199,6 +226,43 @@ function canCompleteMission(ctx: BotContext, mission: Mission, maxJumps: number,
     if (creditReward > 0 && tripCost >= creditReward) {
       return { ok: false, reason: `unprofitable (reward ${creditReward}cr < trip cost ~${tripCost}cr)` };
     }
+  }
+
+  // ── Trade mission shortcut (v0.241.0) ──
+  // Trade missions have sourceBase + destinationBase + buyPrice/sellPrice on the mission itself.
+  // If the API gives us estimated profit, trust it; otherwise compute from buy/sell prices.
+  if (isTradeTypeMission(mission)) {
+    // Discount sell price by 25% — mission estimates are often optimistic (actual prices can be much lower)
+    const sellPrice = (mission.sellPrice ?? 0) * 0.75;
+    const buyPrice = mission.buyPrice ?? 0;
+    const qty = mission.requiredQuantity ?? mission.objectives[0]?.target ?? 1;
+    const profit = (sellPrice - buyPrice) * qty;
+    if (profit <= 0) return { ok: false, reason: `trade mission unprofitable after 25% safety margin (buy ${buyPrice}, sell est. ${mission.sellPrice})` };
+
+    // Check travel distance to source + destination
+    const srcSystem = mission.sourceSystem ?? findMissionTargetSystem(mission);
+    const dstSystem = mission.destinationSystem ?? srcSystem;
+    const jumpsToSrc = estimateJumps(ctx, srcSystem);
+    const jumpsSrcToDst = srcSystem && dstSystem && srcSystem !== dstSystem
+      ? (ctx.galaxy.findPath(srcSystem, dstSystem)?.length ?? Infinity) - 1
+      : 0;
+    const totalTradeJumps = jumpsToSrc + jumpsSrcToDst;
+    if (totalTradeJumps > maxJumps) return { ok: false, reason: `trade route too far (${totalTradeJumps} jumps)` };
+    if (!hasFuelForJumps(ctx, totalTradeJumps + jumpsSrcToDst)) return { ok: false, reason: "not enough fuel for trade route" };
+
+    // Check if we can afford the FULL buy (partial fills don't count — mission requires full quantity)
+    const fullQuantity = mission.requiredQuantity ?? mission.objectives[0]?.target ?? 1;
+    const buyCost = (mission.buyPrice ?? 0) * fullQuantity;
+    if (buyCost <= 0) return { ok: false, reason: "trade mission with no buy price info" };
+    if (buyCost > ctx.player.credits * 0.8) return { ok: false, reason: `can't afford full buy (${buyCost}cr, have ${ctx.player.credits}cr)` };
+
+    // Check cargo space
+    if (fullQuantity > ctx.ship.cargoCapacity) return { ok: false, reason: `cargo too small (need ${fullQuantity}, have ${ctx.ship.cargoCapacity})` };
+
+    const tripCost = estimateTripCost(ctx, totalTradeJumps);
+    if (profit - tripCost <= 0) return { ok: false, reason: `trade profit ${profit}cr doesn't cover fuel (~${tripCost}cr)` };
+
+    return { ok: true };
   }
 
   // Estimate total item acquisition cost for profitability check
@@ -335,7 +399,7 @@ export async function* mission_runner(ctx: BotContext): AsyncGenerator<RoutineYi
       hubStation = ctx.player.dockedAtBase;
     } else {
       try {
-        const system = await ctx.api.getSystem();
+        const system = await fleetGetSystem(ctx);
         const station = system.pois.find((p) => p.hasBase);
         if (station?.baseId) hubStation = station.baseId;
       } catch { /* ok */ }
@@ -485,13 +549,18 @@ export async function* mission_runner(ctx: BotContext): AsyncGenerator<RoutineYi
       const jumpsA = estimateJumps(ctx, findMissionTargetSystem(a.mission));
       const jumpsB = estimateJumps(ctx, findMissionTargetSystem(b.mission));
 
-      // Net profit = reward minus estimated fuel cost
-      const netA = rewardA - estimateTripCost(ctx, jumpsA);
-      const netB = rewardB - estimateTripCost(ctx, jumpsB);
+      // Trade missions: use estimated profit directly (more reliable than reward field)
+      const tradeProfitA = isTradeTypeMission(a.mission) ? (a.mission.estimatedProfit ?? 0) : 0;
+      const tradeProfitB = isTradeTypeMission(b.mission) ? (b.mission.estimatedProfit ?? 0) : 0;
+
+      // Net profit = reward minus estimated fuel cost (+ trade profit bonus)
+      const netA = rewardA + tradeProfitA - estimateTripCost(ctx, jumpsA);
+      const netB = rewardB + tradeProfitB - estimateTripCost(ctx, jumpsB);
 
       // Score: net profit per estimated effort (jumps + objectives)
-      const effortA = Math.max(1, jumpsA + a.mission.objectives.length);
-      const effortB = Math.max(1, jumpsB + b.mission.objectives.length);
+      // Trade missions get effort=1 since they're a single buy→sell flow
+      const effortA = isTradeTypeMission(a.mission) ? Math.max(1, jumpsA) : Math.max(1, jumpsA + a.mission.objectives.length);
+      const effortB = isTradeTypeMission(b.mission) ? Math.max(1, jumpsB) : Math.max(1, jumpsB + b.mission.objectives.length);
 
       const scoreA = netA / effortA;
       const scoreB = netB / effortB;
@@ -545,6 +614,20 @@ async function* executeMission(
   hubStation: string,
 ): AsyncGenerator<RoutineYield, "done" | "stop" | "failed", void> {
   yield `executing: ${mission.title} (${mission.type})`;
+
+  // ── Trade mission fast-path: buy at source → sell at dest → complete ──
+  if (isTradeTypeMission(mission)) {
+    yield `trade mission: buy ${mission.requiredItem} at ${mission.sourceBase} → sell at ${mission.destinationBase}`;
+    const success = yield* handleTradeObjective(ctx, mission);
+    if (!success) {
+      yield "trade mission failed — abandoning";
+      try { await ctx.api.abandonMission(mission.id); } catch { /* ok */ }
+      return "failed";
+    }
+    // Try to complete after trade
+    yield* completeMission(ctx, mission, hubStation);
+    return "done";
+  }
 
   const MAX_CYCLES = 40;
   let cycles = 0;
@@ -653,6 +736,8 @@ async function* handleObjective(
       return yield* handleCollectObjective(ctx, obj);
     case "craft":
       return yield* handleCraftObjective(ctx, obj);
+    case "trade":
+      return yield* handleTradeObjective(ctx, mission);
     case "kill":
       // Should have been filtered out, but handle gracefully
       yield "skipping combat objective";
@@ -686,7 +771,7 @@ async function* handleMineObjective(
   }
 
   await ensureSystemDetail(ctx);
-  const system = await ctx.api.getSystem();
+  const system = await fleetGetSystem(ctx);
   const belt = system.pois.find((p: any) =>
     p.type === "asteroid_belt" || p.type === "ice_field" || p.type === "gas_cloud"
     || p.type === "asteroid" || p.type === "nebula"
@@ -1196,6 +1281,115 @@ async function* handleCraftObjective(
   }
 }
 
+
+/** Trade objective: buy at source, sell at destination (v0.241.0 trade missions) */
+async function* handleTradeObjective(
+  ctx: BotContext,
+  mission: Mission,
+): AsyncGenerator<RoutineYield, boolean, void> {
+  // Trade missions may encode route in mission fields OR in the objective
+  const obj = mission.objectives[0];
+  const sourceBase = mission.sourceBase ?? findMissionIssuingBase(mission);
+  const destBase = mission.destinationBase ?? mission.targetBase ?? obj?.baseId;
+  const itemId = mission.requiredItem ?? obj?.itemId;
+  const quantity = mission.requiredQuantity ?? obj?.target ?? 1;
+
+  if (!sourceBase || !destBase || !itemId) {
+    yield "trade mission missing source/dest/item — treating as deliver";
+    return false;
+  }
+
+  // ── Phase 1: Navigate to source and buy ──
+  if (ctx.player.dockedAtBase !== sourceBase) {
+    yield `heading to source station for ${itemId}`;
+    try {
+      await navigateAndDock(ctx, sourceBase);
+    } catch (err) {
+      yield `nav to source failed: ${err instanceof Error ? err.message : String(err)}`;
+      return false;
+    }
+  }
+
+  // Check cargo space — make room if needed
+  const freeSpace = ctx.ship.cargoCapacity - ctx.ship.cargoUsed;
+  if (freeSpace < quantity) {
+    yield `clearing ${quantity - freeSpace} cargo slots`;
+    for (const item of [...ctx.ship.cargo]) {
+      if (item.itemId === "fuel_cell" || item.quantity <= 0) continue;
+      try {
+        await ctx.api.sell(item.itemId, item.quantity);
+        await ctx.refreshState();
+      } catch {
+        try { await ctx.api.factionDepositItems(item.itemId, item.quantity); await ctx.refreshState(); } catch { /* ok */ }
+      }
+      if (ctx.ship.cargoCapacity - ctx.ship.cargoUsed >= quantity) break;
+    }
+  }
+
+  // Buy the required items
+  const alreadyHave = ctx.ship.cargo.find(c => c.itemId === itemId)?.quantity ?? 0;
+  const toBuy = Math.max(0, quantity - alreadyHave);
+  if (toBuy > 0) {
+    // Cap buy to what we can afford (leave 5% credits buffer)
+    const maxAffordable = mission.buyPrice
+      ? Math.floor((ctx.player.credits * 0.95) / mission.buyPrice)
+      : toBuy;
+    const buyQty = Math.min(toBuy, maxAffordable);
+    if (buyQty <= 0) {
+      yield `can't afford to buy ${itemId} at ${mission.buyPrice}cr each`;
+      return false;
+    }
+    yield `buying ${buyQty} ${itemId}`;
+    try {
+      await ctx.api.buy(itemId, buyQty);
+      await ctx.refreshState();
+    } catch (err) {
+      yield `buy failed: ${err instanceof Error ? err.message : String(err)}`;
+      // Try with less quantity
+      if (buyQty > 1) {
+        const halfQty = Math.ceil(buyQty / 2);
+        try { await ctx.api.buy(itemId, halfQty); await ctx.refreshState(); } catch { return false; }
+      } else {
+        return false;
+      }
+    }
+  }
+
+  // ── Phase 2: Navigate to destination and sell ──
+  if (ctx.player.dockedAtBase) {
+    try { await ctx.api.undock(); await ctx.refreshState(); } catch { /* ok */ }
+  }
+
+  yield `heading to destination to sell ${itemId}`;
+  try {
+    await navigateAndDock(ctx, destBase);
+  } catch (err) {
+    yield `nav to destination failed: ${err instanceof Error ? err.message : String(err)}`;
+    // Emergency: sell at current location if possible
+    if (!ctx.player.dockedAtBase) {
+      try { await findAndDock(ctx); } catch { return false; }
+    }
+    const held = ctx.ship.cargo.find(c => c.itemId === itemId)?.quantity ?? 0;
+    if (held > 0) {
+      try { await ctx.api.sell(itemId, held); await ctx.refreshState(); } catch { /* ok */ }
+    }
+    return false;
+  }
+
+  // Sell the trade items
+  const held = ctx.ship.cargo.find(c => c.itemId === itemId)?.quantity ?? 0;
+  if (held > 0) {
+    yield `selling ${held} ${itemId}`;
+    try {
+      await ctx.api.sell(itemId, held);
+      await ctx.refreshState();
+    } catch (err) {
+      yield `sell failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  return true;
+}
 
 /** Complete a finished mission — dock and submit */
 async function* completeMission(

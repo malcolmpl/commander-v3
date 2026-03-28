@@ -30,7 +30,11 @@ import {
   safetyCheck,
   getParam,
   equipModulesForRoutine,
+  fleetGetSystem,
+  fleetAnalyzeMarket,
+  fleetGetPoi,
 } from "./helpers";
+import { isSystemExplored, KNOWN_RESOURCE_LOCATIONS } from "../data/resource-locations";
 
 /** Threshold in ms: stations with data older than this get priority */
 const STALE_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes
@@ -112,8 +116,24 @@ export async function* explorer(ctx: BotContext): AsyncGenerator<RoutineYield, v
         await refuelIfNeeded(ctx);
       }
 
-      // Navigate to system
+      // Navigate to system — with round-trip fuel check
       if (systemId !== ctx.player.currentSystem) {
+        const fuelPerJump = ctx.nav.estimateJumpFuel(ctx.ship);
+        const dist = ctx.galaxy.getDistance(ctx.player.currentSystem ?? "", systemId);
+        if (dist > 0) {
+          const homeSystem = ctx.fleetConfig.homeSystem ?? ctx.player.currentSystem ?? "";
+          const distHome = ctx.galaxy.getDistance(systemId, homeSystem);
+          const returnDist = Math.max(1, distHome > 0 ? distHome : dist);
+          const fuelNeeded = (dist + returnDist) * fuelPerJump + 3;
+          if (ctx.ship.fuel < fuelNeeded) {
+            if (ctx.ship.fuel < fuelPerJump * 3) {
+              yield `fuel too low to continue exploring (${ctx.ship.fuel} fuel) — ending`;
+              break;
+            }
+            yield `skipping ${systemId}: insufficient fuel for round trip`;
+            continue;
+          }
+        }
         yield `jumping to ${systemId}`;
         try {
           await navigateTo(ctx, systemId);
@@ -184,27 +204,35 @@ async function* planRoute(
       }
     }
 
-    // System with no POI data = unexplored
-    if (sys.pois.length === 0) {
+    // System with no POI data = unexplored (unless we already know it from resource-locations.ts)
+    const alreadyExplored = isSystemExplored(sys.id);
+    if (sys.pois.length === 0 && !alreadyExplored) {
       score += UNEXPLORED_PRIORITY;
       reason = reason || "unexplored";
     }
 
     // Resource POI bonus: systems with belts/ice/gas are more valuable
-    // (miners/harvesters need this data to decide where to work)
+    // Skip bonus for systems already in KNOWN_RESOURCE_LOCATIONS (ore data is known)
     let hasResourcePois = false;
+    const hasKnownResources = sys.id in KNOWN_RESOURCE_LOCATIONS;
     for (const poi of sys.pois) {
       const t = poi.type;
       if (t === "asteroid_belt" || t === "asteroid" || t === "ice_field" || t === "gas_cloud" || t === "nebula") {
         hasResourcePois = true;
-        score += RESOURCE_POI_BONUS;
-        // Check for rare/valuable ores in known resources
-        if (poi.resources) {
-          for (const res of poi.resources) {
-            if (RARE_ORES.has(res.resourceId) && res.remaining > 0) {
-              score += RARE_ORE_BONUS;
-              reason = reason || `rare: ${res.resourceId}`;
-              break;
+        // Only award resource bonus if we DON'T already have this data
+        // AND the POI hasn't been scanned recently (2hr freshness)
+        const scannedAt = ctx.galaxy.getPoiScannedAt(poi.id);
+        const scanAge = scannedAt > 0 ? Date.now() - scannedAt : Infinity;
+        if (!hasKnownResources && scanAge > 7_200_000) { // >2hr since last scan
+          score += RESOURCE_POI_BONUS;
+          // Check for rare/valuable ores in known resources
+          if (poi.resources) {
+            for (const res of poi.resources) {
+              if (RARE_ORES.has(res.resourceId) && res.remaining > 0) {
+                score += RARE_ORE_BONUS;
+                reason = reason || `rare: ${res.resourceId}`;
+                break;
+              }
             }
           }
         }
@@ -235,7 +263,7 @@ async function* planRoute(
 
   // ── Also check immediate neighbors that might not be in galaxy graph yet ──
   try {
-    const currentSystemInfo = await ctx.api.getSystem();
+    const currentSystemInfo = await fleetGetSystem(ctx);
     for (const connId of (currentSystemInfo.connections ?? [])) {
       if (targets.some(t => t.systemId === connId)) continue;
       const sys = ctx.galaxy.getSystem(connId);
@@ -347,12 +375,7 @@ async function* exploreSystem(
 
   let systemInfo;
   try {
-    systemInfo = await ctx.api.getSystem();
-    // Save system detail to galaxy graph + cache
-    if (systemInfo.id) {
-      ctx.galaxy.updateSystem(systemInfo);
-      ctx.cache.setSystemDetail(systemInfo.id, systemInfo);
-    }
+    systemInfo = await fleetGetSystem(ctx);
     yield `found ${systemInfo.pois.length} POIs in ${systemInfo.name}`;
   } catch (err) {
     yield `survey error: ${err instanceof Error ? err.message : String(err)}`;
@@ -383,19 +406,30 @@ async function* exploreSystem(
   const skipped = systemInfo.pois.length - pois.length;
   if (skipped > 0) yield `skipping ${skipped} non-resource POI(s) (planets, etc.)`;
 
+  const POI_SCAN_FRESHNESS_MS = 7_200_000; // 2 hours — skip POIs scanned within this window
   let poiDataUpdated = false;
   for (const poi of pois) {
     if (ctx.shouldStop) break;
+
+    // Skip resource POIs that were recently scanned (2hr freshness)
+    const isResourcePoi = VALUABLE_POI_TYPES.has(poi.type);
+    if (isResourcePoi && !poi.hasBase) {
+      const lastScan = ctx.galaxy.getPoiScannedAt(poi.id);
+      if (lastScan > 0 && (Date.now() - lastScan) < POI_SCAN_FRESHNESS_MS) {
+        yield `skipping ${poi.name} (scanned ${Math.round((Date.now() - lastScan) / 60_000)}m ago)`;
+        continue;
+      }
+    }
 
     yield `scanning ${poi.name}`;
     try {
       await ctx.api.travel(poi.id);
       await ctx.refreshState();
 
-      // Get detailed POI info and save resources
-      const detail = await ctx.api.getPoi();
-      if (detail.resources.length > 0) {
-        ctx.galaxy.updatePoiResources(poi.id, detail.resources);
+      // Get detailed POI info and save resources (fleet-deduped)
+      const detail = await fleetGetPoi(ctx, poi.id);
+      if (detail && detail.resources.length > 0) {
+        // fleetGetPoi already calls updatePoiResources
         poiDataUpdated = true;
 
         const isBelt = poi.type === "asteroid_belt" || poi.type === "gas_cloud"
@@ -418,22 +452,41 @@ async function* exploreSystem(
         yield `${poi.name}: ${poi.type}, no resources`;
       }
 
-      // Dock at stations — this triggers market scan + analyze_market + trade intel via dockAtCurrent
+      // Dock at stations — dockAtCurrent auto-scans market + shipyard when cache is stale
       if (poi.hasBase) {
         try {
           await dockAtCurrent(ctx);
-          yield `${poi.baseName}: docked, market scanned`;
+          // dockAtCurrent already calls viewMarket + browseShips + cacheMarketData
 
-          // Log market insights if available
           if (poi.baseId) {
-            const insights = ctx.cache.getMarketInsights(poi.baseId);
-            if (insights && insights.length > 0) {
-              const topInsights = insights
-                .sort((a, b) => b.priority - a.priority)
-                .slice(0, 3);
-              for (const insight of topInsights) {
-                yield `  insight [${insight.category}]: ${insight.message}`;
+            // Report market status
+            const prices = ctx.cache.getMarketPrices(poi.baseId);
+            if (prices && prices.length > 0) {
+              const buyCount = prices.filter(p => (p.buyPrice ?? 0) > 0).length;
+              const sellCount = prices.filter(p => (p.sellPrice ?? 0) > 0).length;
+              yield `${poi.baseName}: ${prices.length} items (${buyCount} buy, ${sellCount} sell)`;
+            } else {
+              yield `${poi.baseName}: docked`;
+            }
+
+            // Analyze market for demand/pricing insights (rate-limited mutation)
+            try {
+              await fleetAnalyzeMarket(ctx, poi.baseId);
+              const cachedInsights = ctx.cache.getMarketInsights(poi.baseId);
+              if (cachedInsights && cachedInsights.length > 0) {
+                const topInsights = cachedInsights
+                  .sort((a, b) => b.priority - a.priority)
+                  .slice(0, 3);
+                for (const insight of topInsights) {
+                  yield `  insight [${insight.category}]: ${insight.message}`;
+                }
               }
+            } catch { /* insights non-critical */ }
+
+            // Report shipyard if available
+            const shipyard = ctx.cache.getShipyardData(poi.baseId);
+            if (shipyard && shipyard.length > 0) {
+              yield `${poi.baseName}: ${shipyard.length} ship(s) at shipyard`;
             }
           }
 

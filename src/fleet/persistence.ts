@@ -5,7 +5,7 @@
 
 import { eq } from "drizzle-orm";
 import type { DB } from "../data/db";
-import { botSettings, fleetSettings, goals } from "../data/schema";
+import { botSettings, botSkills, fleetSettings, goals } from "../data/schema";
 import type { Goal } from "../config/schema";
 
 // ── Bot Settings ──
@@ -60,6 +60,36 @@ export function loadBotSettings(db: DB, username: string): BotSettingsData | nul
     role: row.role ?? null,
     manualControl: row.manualControl === 1,
   };
+}
+
+// ── Bot Skills ──
+
+export type BotSkillsData = Record<string, { level: number; xp: number; xpNext: number }>;
+
+export function saveBotSkills(db: DB, username: string, skills: BotSkillsData): void {
+  db.insert(botSkills)
+    .values({
+      username,
+      skills: JSON.stringify(skills),
+    })
+    .onConflictDoUpdate({
+      target: botSkills.username,
+      set: {
+        skills: JSON.stringify(skills),
+        updatedAt: new Date().toISOString().replace("T", " ").slice(0, 19),
+      },
+    })
+    .run();
+}
+
+export function loadBotSkills(db: DB, username: string): BotSkillsData | null {
+  const row = db.select().from(botSkills).where(eq(botSkills.username, username)).get();
+  if (!row) return null;
+  try {
+    return JSON.parse(row.skills) as BotSkillsData;
+  } catch {
+    return null;
+  }
 }
 
 // ── Fleet Settings ──

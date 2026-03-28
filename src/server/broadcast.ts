@@ -10,12 +10,27 @@ import type { EconomyEngine } from "../commander/economy-engine";
 import type { Galaxy } from "../core/galaxy";
 import type { DB } from "../data/db";
 import type { SocialChatMessage, SocialForumThread, SocialDM, FactionState, FactionMember, FactionFacility, OpenOrder, BrainDecisionStats } from "../types/protocol";
+import type { MarketOrder } from "../types/game";
 import { creditHistory, activityLog } from "../data/schema";
 import { lt } from "drizzle-orm";
 import type { TrainingLogger } from "../data/training-logger";
-import { ChatIntelligence } from "../commander/chat-intelligence";
+import { ChatIntelligence, type ChatFleetContext } from "../commander/chat-intelligence";
 import { broadcast, getClientCount } from "./server";
 import { promoteFactionMembers } from "../fleet/faction-manager";
+
+export interface BroadcastConfig {
+  tickIntervalMs: number;
+  snapshotIntervalTicks: number;
+  creditHistoryIntervalTicks: number;
+  maxGlobalSnapshots: number;
+}
+
+const DEFAULT_BROADCAST_CONFIG: BroadcastConfig = {
+  tickIntervalMs: 3_000,
+  snapshotIntervalTicks: 10,     // 30s
+  creditHistoryIntervalTicks: 10, // 30s
+  maxGlobalSnapshots: 10_000,
+};
 
 export interface BroadcastDeps {
   botManager: BotManager;
@@ -25,11 +40,8 @@ export interface BroadcastDeps {
   db: DB;
   startTime: number;
   trainingLogger?: TrainingLogger;
+  broadcastConfig?: Partial<BroadcastConfig>;
 }
-
-const TICK_INTERVAL_MS = 3_000;
-const SNAPSHOT_INTERVAL_TICKS = 10; // 30s
-const CREDIT_HISTORY_INTERVAL_TICKS = 10; // 30s
 
 // Cached 24h financial totals (refreshed from DB every 30s)
 let cached24hTotals = { revenue: 0, cost: 0, profit: 0 };
@@ -42,11 +54,53 @@ let cachedFactionOrders: OpenOrder[] = [];
 let cachedFacilityTypes: import("../types/protocol").FacilityTypeInfo[] | null = null;
 let factionDebugLogged = false;
 
-// Concurrency guards — prevent overlapping async polls from racing
-let factionPolling = false;
-let ordersPolling = false;
-let socialPolling = false;
-let chatPolling = false;
+/**
+ * PollQueue — unified concurrency control for async polls.
+ * Prevents overlapping calls, auto-deduplicates pending requests,
+ * and retries transient failures.
+ */
+class PollQueue {
+  private active: string | null = null;
+  private queue: Array<{ name: string; fn: () => Promise<void>; retries: number }> = [];
+  private processing = false;
+
+  /** Enqueue a poll. If already queued by name, replaces it (dedup). */
+  enqueue(name: string, fn: () => Promise<void>, maxRetries = 1): void {
+    // Don't enqueue if already active
+    if (this.active === name) return;
+    // Dedup pending
+    this.queue = this.queue.filter(q => q.name !== name);
+    this.queue.push({ name, fn, retries: maxRetries });
+    this.processNext();
+  }
+
+  private async processNext(): Promise<void> {
+    if (this.processing || this.queue.length === 0) return;
+    this.processing = true;
+    const req = this.queue.shift()!;
+    this.active = req.name;
+    try {
+      await req.fn();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[PollQueue] ${req.name} failed: ${msg}`);
+      if (req.retries > 0) {
+        req.retries--;
+        this.queue.push(req); // Retry at end
+      }
+    } finally {
+      this.active = null;
+      this.processing = false;
+      // Process next if any
+      if (this.queue.length > 0) {
+        // Use queueMicrotask to avoid deep recursion
+        queueMicrotask(() => this.processNext());
+      }
+    }
+  }
+}
+
+const pollQueue = new PollQueue();
 
 /** Per-bot credit snapshots for rate calculation */
 interface CreditSnapshot {
@@ -58,9 +112,11 @@ interface CreditSnapshot {
  * Start the periodic broadcast loop. Returns a cleanup function.
  */
 export function startBroadcastLoop(deps: BroadcastDeps): () => void {
+  const cfg = { ...DEFAULT_BROADCAST_CONFIG, ...deps.broadcastConfig };
   let tick = 0;
   const lastCredits = new Map<string, number>();
   const botSnapshots = new Map<string, CreditSnapshot[]>();
+  let totalSnapshotCount = 0; // Track global snapshot count for cap enforcement
   const promotedBots = new Set<string>();
   const RATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
   let cachedOrders: OpenOrder[] = [];
@@ -70,7 +126,11 @@ export function startBroadcastLoop(deps: BroadcastDeps): () => void {
   // Chat intelligence — reads and learns from global/faction chat (shared with Commander)
   const botNames = deps.botManager.getAllBots().map(b => b.username);
   const memStore = deps.commander.getMemoryStore();
-  const chatIntel = new ChatIntelligence(memStore, botNames);
+  const aiSettings = deps.commander.getAiSettings();
+  const chatIntel = new ChatIntelligence(memStore, botNames, {
+    baseUrl: aiSettings?.ollamaBaseUrl ?? "http://localhost:11434",
+    model: aiSettings?.ollamaModel ?? "qwen3:8b",
+  });
   deps.commander.setChatIntelligence(chatIntel);
 
   const timer = setInterval(() => {
@@ -96,30 +156,74 @@ export function startBroadcastLoop(deps: BroadcastDeps): () => void {
           if (delta < 0) delta += factionDeposits;     // Deposit deflates credits — add back
         }
 
+        // Map routine to a cleaner financial source category
+        const routineToSource = (r?: string): string => {
+          if (!r) return "unknown";
+          switch (r) {
+            case "miner": case "harvester": return "mining";
+            case "crafter": return "crafting";
+            case "trader": return "trading";
+            case "mission_runner": return "mission";
+            case "quartermaster": return "quartermaster";
+            default: return r;
+          }
+        };
+        const financialSource = routineToSource(bot.routine ?? undefined);
+
         if (delta > 0) {
           ecoTracker.recordRevenue(delta);
-          deps.trainingLogger?.logFinancialEvent("revenue", delta, bot.botId);
+          deps.trainingLogger?.logFinancialEvent("revenue", delta, bot.botId, financialSource);
         } else if (delta < 0) {
           ecoTracker.recordCost(Math.abs(delta));
-          deps.trainingLogger?.logFinancialEvent("cost", Math.abs(delta), bot.botId);
+          deps.trainingLogger?.logFinancialEvent("cost", Math.abs(delta), bot.botId, financialSource);
         }
       }
       lastCredits.set(bot.botId, bot.credits);
 
       // Periodic snapshots for CPH calculation
-      if (tick % SNAPSHOT_INTERVAL_TICKS === 0) {
+      if (tick % cfg.snapshotIntervalTicks === 0) {
         const snaps = botSnapshots.get(bot.botId) ?? [];
+        const prevLen = snaps.length;
         snaps.push({ timestamp: Date.now(), credits: bot.credits });
 
-        // Prune old snapshots
+        // Prune old snapshots + hard cap at 600 per bot
         const cutoff = Date.now() - RATE_WINDOW_MS;
-        const pruned = snaps.filter(s => s.timestamp > cutoff);
+        let pruned = snaps.filter(s => s.timestamp > cutoff);
+        if (pruned.length > 600) pruned = pruned.slice(pruned.length - 600);
         botSnapshots.set(bot.botId, pruned);
+        totalSnapshotCount += pruned.length - prevLen;
+      }
+    }
+
+    // Global snapshot cap: if total across all bots exceeds limit, evict oldest from largest bot
+    if (totalSnapshotCount > cfg.maxGlobalSnapshots) {
+      let largestBot = "";
+      let largestCount = 0;
+      for (const [botId, snaps] of botSnapshots) {
+        if (snaps.length > largestCount) { largestBot = botId; largestCount = snaps.length; }
+      }
+      if (largestBot && largestCount > 10) {
+        const snaps = botSnapshots.get(largestBot)!;
+        const trimTo = Math.floor(largestCount * 0.75); // Drop 25% of oldest
+        botSnapshots.set(largestBot, snaps.slice(largestCount - trimTo));
+        totalSnapshotCount -= largestCount - trimTo;
+      }
+    }
+
+    // Clean up snapshots for bots no longer in fleet
+    if (tick % 100 === 0) {
+      const activeBotIds = new Set(fleet.bots.map(b => b.botId));
+      for (const [botId, snaps] of botSnapshots) {
+        if (!activeBotIds.has(botId)) {
+          totalSnapshotCount -= snaps.length;
+          botSnapshots.delete(botId);
+          lastCredits.delete(botId);
+        }
       }
     }
 
     // Credit history to DB (every 30s)
-    if (tick % CREDIT_HISTORY_INTERVAL_TICKS === 0) {
+    if (tick % cfg.creditHistoryIntervalTicks === 0) {
       deps.db.insert(creditHistory)
         .values({
           timestamp: Date.now(),
@@ -309,12 +413,7 @@ export function startBroadcastLoop(deps: BroadcastDeps): () => void {
 
     // Faction state polling (every 60s)
     if (tick % 20 === 0) {
-      if (!factionPolling) {
-        factionPolling = true;
-        pollFactionState(deps)
-          .catch(err => console.warn(`[Broadcast] pollFactionState failed:`, err instanceof Error ? err.message : err))
-          .finally(() => { factionPolling = false; });
-      }
+      pollQueue.enqueue("faction", () => pollFactionState(deps));
     }
 
     // Auto-diplomacy: accept peace proposals (every 5 minutes)
@@ -334,13 +433,9 @@ export function startBroadcastLoop(deps: BroadcastDeps): () => void {
 
     // Open orders polling (every 30s)
     if (tick % 10 === 0) {
-      if (!ordersPolling) {
-        ordersPolling = true;
-        pollOpenOrders(deps).then(orders => {
-          cachedOrders = orders;
-        }).catch(err => console.warn(`[Broadcast] pollOpenOrders failed:`, err instanceof Error ? err.message : err))
-          .finally(() => { ordersPolling = false; });
-      }
+      pollQueue.enqueue("orders", async () => {
+        cachedOrders = await pollOpenOrders(deps);
+      });
 
       // Refresh 24h financial totals from DB (persists across restarts)
       if (deps.trainingLogger) {
@@ -350,23 +445,13 @@ export function startBroadcastLoop(deps: BroadcastDeps): () => void {
 
     // Social feed polling (every 30s — uses bot API queries)
     if (tick % 10 === 0) {
-      if (!socialPolling) {
-        socialPolling = true;
-        pollSocialFeed(deps)
-          .catch(err => console.warn(`[Broadcast] pollSocialFeed failed:`, err instanceof Error ? err.message : err))
-          .finally(() => { socialPolling = false; });
-      }
+      pollQueue.enqueue("social", () => pollSocialFeed(deps));
     }
 
     // Chat intelligence: read + analyze + reply (~every 30s for reading, ~5min for status posting)
     if (tick % 10 === 0) {
       chatIntel.updateBotNames(deps.botManager.getAllBots().map(b => b.username));
-      if (!chatPolling) {
-        chatPolling = true;
-        readAndRespondToChat(deps, chatIntel)
-          .catch(err => console.warn(`[Broadcast] readAndRespondToChat failed:`, err instanceof Error ? err.message : err))
-          .finally(() => { chatPolling = false; });
-      }
+      pollQueue.enqueue("chat", () => readAndRespondToChat(deps, chatIntel));
     }
     // Disabled: generic chat messages spam public channels when multiple fleets are active
     // if (tick - lastSocialChatTick >= SOCIAL_CHAT_INTERVAL_TICKS) {
@@ -374,7 +459,7 @@ export function startBroadcastLoop(deps: BroadcastDeps): () => void {
     //   postFactionChatUpdate(deps).catch(() => {});
     // }
 
-  }, TICK_INTERVAL_MS);
+  }, cfg.tickIntervalMs);
 
   return () => clearInterval(timer);
 }
@@ -766,6 +851,29 @@ async function readAndRespondToChat(deps: BroadcastDeps, chatIntel: ChatIntellig
   const readyBot = bots.find(b => (b.status === "running" || b.status === "ready") && b.api);
   if (!readyBot?.api) return;
 
+  // Update fleet context for LLM chat persona
+  try {
+    const fleet = deps.botManager.getFleetStatus();
+    const eco = deps.commander.getEconomy();
+    const snap = eco.analyze(fleet);
+    const selling: Array<{ item: string; qty: number; price?: number }> = [];
+    if (cachedFactionStorage) {
+      for (const s of cachedFactionStorage.filter(i => !i.itemId.startsWith("ore_") && i.quantity >= 3)) {
+        selling.push({ item: s.itemName, qty: s.quantity });
+      }
+    }
+    chatIntel.setFleetContext({
+      factionName: "Castellan Industrial",
+      factionTag: "CAST",
+      botCount: fleet.activeBots,
+      totalCredits: fleet.totalCredits,
+      homeSystem: deps.botManager.fleetConfig.homeSystem || "sol",
+      selling: selling.slice(0, 8),
+      buying: snap.deficits.filter(d => d.priority === "critical").map(d => ({ item: d.itemId.replace(/_/g, " ") })),
+      systems: [...new Set(fleet.bots.map(b => b.systemId).filter(Boolean))].slice(0, 6) as string[],
+    });
+  } catch { /* non-critical */ }
+
   // Read from both channels
   for (const channel of ["system", "faction"] as const) {
     try {
@@ -967,47 +1075,62 @@ async function updateFactionBulletinBoard(deps: BroadcastDeps): Promise<void> {
   }
 }
 
-/** Poll open orders from all bots and aggregate */
+/** Poll open orders from all bots (personal) and faction orders */
 async function pollOpenOrders(deps: BroadcastDeps): Promise<OpenOrder[]> {
   const bots = deps.botManager.getAllBots();
   const readyBots = bots.filter(b => (b.status === "running" || b.status === "ready") && b.api);
   if (readyBots.length === 0) return [];
 
   const allOrders: OpenOrder[] = [];
-  // Query ALL ready bots for their orders (each bot sees only their own)
-  // Quartermasters create faction orders — label those accordingly
-  const results = await Promise.allSettled(
+  const seenIds = new Set<string>();
+
+  function addOrder(order: OpenOrder) {
+    if (!seenIds.has(order.id)) {
+      seenIds.add(order.id);
+      allOrders.push(order);
+    }
+  }
+
+  function mapOrder(o: MarketOrder, botName: string, owner: "personal" | "faction"): OpenOrder {
+    return {
+      id: String(o.id),
+      type: o.type as "buy" | "sell",
+      itemId: o.itemId,
+      itemName: o.itemName || o.itemId.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase()),
+      quantity: o.quantity,
+      filled: o.quantity - (o.remaining ?? o.quantity),
+      priceEach: o.priceEach,
+      total: o.priceEach * o.quantity,
+      stationId: o.stationId ?? "",
+      stationName: o.stationName ?? o.stationId ?? "",
+      createdAt: o.createdAt ?? "",
+      botId: botName,
+      owner,
+    };
+  }
+
+  // 1. Query each bot for their personal orders (at any station — omit stationId)
+  const personalResults = await Promise.allSettled(
     readyBots.map(async (bot) => {
       const orders = await bot.api!.viewOrders();
-      const isFactionBot = bot.routine === "quartermaster";
-      return orders.map(o => ({
-        id: String(o.id),
-        type: o.type as "buy" | "sell",
-        itemId: o.itemId,
-        itemName: o.itemName || o.itemId.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
-        quantity: o.quantity,
-        filled: o.quantity - (o.remaining ?? o.quantity),
-        priceEach: o.priceEach,
-        total: o.priceEach * o.quantity,
-        stationId: o.stationId ?? "",
-        stationName: o.stationName ?? o.stationId ?? "",
-        createdAt: o.createdAt ?? "",
-        botId: isFactionBot ? "Faction" : bot.username,
-        owner: isFactionBot ? "faction" as const : "personal" as const,
-      }));
+      return orders.map(o => mapOrder(o, bot.username, "personal"));
     })
   );
-
-  const seenIds = new Set<string>();
-  for (const result of results) {
+  for (const result of personalResults) {
     if (result.status === "fulfilled") {
-      for (const order of result.value) {
-        if (!seenIds.has(order.id)) {
-          seenIds.add(order.id);
-          allOrders.push(order);
-        }
-      }
+      for (const order of result.value) addOrder(order);
     }
+  }
+
+  // 2. Query faction orders using one bot (scope: "faction")
+  const factionBot = readyBots.find(b => b.api);
+  if (factionBot?.api) {
+    try {
+      const factionOrders = await factionBot.api.viewOrders(undefined, "faction");
+      for (const o of factionOrders) {
+        addOrder(mapOrder(o, "Faction", "faction"));
+      }
+    } catch { /* faction orders non-critical */ }
   }
 
   return allOrders;

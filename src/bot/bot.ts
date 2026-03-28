@@ -109,6 +109,9 @@ export class Bot {
   /** Optional callback invoked on each routine state yield (for broadcasting to dashboard) */
   onStateChange: ((botId: string, routine: string, state: string) => void) | null = null;
 
+  /** Optional callback invoked when skills are freshly fetched from API (for DB persistence) */
+  onSkillsRefreshed: ((username: string, skills: Record<string, { level: number; xp: number; xpNext: number }>) => void) | null = null;
+
   constructor(id: string, username: string) {
     this.id = id;
     this.username = username;
@@ -204,6 +207,14 @@ export class Bot {
     return levels;
   }
 
+  /** Seed skills from DB on startup (avoids API call until refresh). */
+  seedSkills(skills: Record<string, { level: number; xp: number; xpNext: number }>): void {
+    if (Object.keys(skills).length > 0) {
+      this._skills = skills;
+      // Don't set _skillsRefreshedAt — will still refresh from API on first opportunity
+    }
+  }
+
   private static SKILL_REFRESH_MS = 10 * 60_000; // 10 minutes
 
   /** Re-fetch skills from API if stale. Free query, no tick cost. */
@@ -214,6 +225,7 @@ export class Bot {
     try {
       this._skills = await this.deps.api.getSkills();
       this._skillsRefreshedAt = Date.now();
+      this.onSkillsRefreshed?.(this.username, this._skills);
     } catch {
       // Non-critical — keep using existing skill data
     }
@@ -453,6 +465,7 @@ export class Bot {
       try {
         this._skills = await this.deps.api.getSkills();
         this._skillsRefreshedAt = Date.now();
+        this.onSkillsRefreshed?.(this.username, this._skills);
       } catch {
         // Skills from login PlayerState will be used as fallback
       }

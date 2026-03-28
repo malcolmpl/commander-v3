@@ -68,6 +68,16 @@
 		reassignmentThreshold: 0.3,
 	});
 
+	// AI settings
+	let aiSettings = $state({
+		ollamaModel: "qwen3:8b",
+		ollamaBaseUrl: "http://localhost:11434",
+	});
+
+	function saveAiSettings() {
+		send({ type: "update_ai_settings" as any, settings: { ...aiSettings } });
+	}
+
 	// Fleet settings
 	let fleetSettings = $state({
 		maxBots: 20,
@@ -294,10 +304,10 @@
 			<div class="space-y-4 max-w-md">
 				<div>
 					<label class="block text-sm text-chrome-silver mb-1">Brain Type</label>
-					<select class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none">
-						<option>Scoring</option>
-						<option disabled>LLM (Coming Soon)</option>
+					<select class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none" disabled>
+						<option>Tiered (Ollama → Gemini → Claude → Scoring)</option>
 					</select>
+					<p class="text-xs text-hull-grey mt-1">Brain type is set in config.toml [commander] brain = "tiered"</p>
 				</div>
 				<div>
 					<label class="block text-sm text-chrome-silver mb-1">Evaluation Interval (seconds)</label>
@@ -324,6 +334,36 @@
 						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
 					/>
 				</div>
+			</div>
+
+			<!-- AI Model Settings -->
+			<h3 class="text-md font-semibold text-star-white mt-6 mb-3">AI Model</h3>
+			<div class="space-y-4 max-w-md">
+				<div>
+					<label class="block text-sm text-chrome-silver mb-1">Ollama Model</label>
+					<input
+						type="text"
+						bind:value={aiSettings.ollamaModel}
+						placeholder="qwen3:8b"
+						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
+					/>
+					<p class="text-xs text-hull-grey mt-1">Model name as shown in `ollama list` (e.g., qwen3:8b, llama3.1:8b, mistral:7b)</p>
+				</div>
+				<div>
+					<label class="block text-sm text-chrome-silver mb-1">Ollama Base URL</label>
+					<input
+						type="text"
+						bind:value={aiSettings.ollamaBaseUrl}
+						placeholder="http://localhost:11434"
+						class="w-full px-3 py-2 bg-deep-void border border-hull-grey/50 rounded-lg text-star-white text-sm focus:border-plasma-cyan focus:outline-none"
+					/>
+				</div>
+				<button
+					class="px-4 py-2 bg-plasma-cyan/20 text-plasma-cyan rounded-lg hover:bg-plasma-cyan/30 transition-colors text-sm"
+					onclick={saveAiSettings}
+				>
+					Apply AI Settings
+				</button>
 			</div>
 
 		{:else if activeTab === "fleet"}

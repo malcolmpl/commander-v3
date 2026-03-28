@@ -5,15 +5,48 @@
  */
 
 import type { EvaluationInput, WorldContext, EconomySnapshot } from "./types";
-import type { FleetBotInfo } from "../bot/types";
+import type { FleetBotInfo, FleetStatus } from "../bot/types";
 import type { Goal } from "../config/schema";
 import type { RoutineName } from "../types/protocol";
+import type { StrategicTrigger } from "./strategic-triggers";
+import type { RetrievedMemory } from "./embedding-store";
 
 const VALID_ROUTINES: RoutineName[] = [
   "miner", "crafter", "trader", "quartermaster", "explorer",
   "return_home", "scout", "ship_upgrade", "refit",
   "harvester", "hunter", "salvager", "scavenger", "mission_runner",
 ];
+
+/** Levenshtein distance between two strings */
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+/** Fuzzy-match a string against a set of valid values. Returns match if distance <= maxDist. */
+function fuzzyMatch(input: string, validSet: Iterable<string>, maxDist = 2): string | null {
+  const lower = input.toLowerCase().trim();
+  let bestMatch: string | null = null;
+  let bestDist = maxDist + 1;
+  for (const candidate of validSet) {
+    const dist = levenshtein(lower, candidate.toLowerCase());
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestMatch = candidate;
+    }
+  }
+  return bestDist <= maxDist ? bestMatch : null;
+}
 
 /** Build system prompt (stable, cacheable). If promptFile is set, loads from disk (fresh each eval). */
 export function buildSystemPrompt(promptFile?: string): string {
@@ -209,7 +242,93 @@ function formatWorld(world: WorldContext): string {
   return parts.join("\n");
 }
 
-/** Try to extract a JSON object from text that may contain thinking/narrative */
+// ── Strategic Prompt (focused, for trigger-based LLM calls) ──
+
+/** Build a focused system prompt for strategic-only LLM consultations */
+export function buildStrategicSystemPrompt(): string {
+  return `You are a fleet strategy advisor for SpaceMolt, a space MMO.
+You are consulted ONLY when something strategically significant happens (not every tick).
+The fleet's routine assignments are handled by a deterministic scoring engine.
+
+Your job: analyze the strategic trigger and recommend CHANGES to the fleet's approach.
+
+AVAILABLE ROUTINES: miner, harvester, crafter, trader, quartermaster, explorer, hunter, salvager, scavenger, mission_runner, scout, ship_upgrade, refit, return_home
+
+You may recommend:
+1. Reassigning specific bots to different routines (if the scoring engine is making poor choices)
+2. Strategic observations (e.g., "iron trading is declining, shift to crafting")
+3. No changes needed (if the scoring engine is handling it well)
+
+OUTPUT FORMAT (strict JSON):
+{
+  "assignments": [
+    { "botId": "bot_id", "routine": "routine_name", "reasoning": "why" }
+  ],
+  "strategic_advice": "One sentence about fleet-level strategy",
+  "confidence": 0.85
+}
+
+Return empty assignments if no changes needed. ONLY raw JSON, no explanation.`;
+}
+
+/**
+ * Build a focused user prompt for a strategic trigger.
+ * Much smaller than the full eval prompt — only includes:
+ * 1. The trigger (why was the LLM called?)
+ * 2. Retrieved memories (relevant past outcomes)
+ * 3. Fleet summary (compact, not full state dump)
+ * 4. Economy summary
+ */
+export function buildStrategicUserPrompt(
+  trigger: StrategicTrigger,
+  memories: RetrievedMemory[],
+  fleet: FleetStatus,
+  economy: EconomySnapshot,
+  goals: Array<{ type: string; priority: number }>,
+): string {
+  const sections: string[] = [];
+
+  // 1. Trigger
+  sections.push(`STRATEGIC TRIGGER [${trigger.type}] (priority ${trigger.priority}):\n${trigger.reason}`);
+
+  // 2. Retrieved memories
+  if (memories.length > 0) {
+    const memLines = memories.map(m => {
+      const profit = m.profitImpact != null
+        ? ` (${m.profitImpact > 0 ? "+" : ""}${Math.round(m.profitImpact)}cr)`
+        : "";
+      return `  - ${m.text}${profit}`;
+    });
+    sections.push(`RELEVANT PAST OUTCOMES:\n${memLines.join("\n")}`);
+  }
+
+  // 3. Goals
+  if (goals.length > 0) {
+    sections.push(`GOALS: ${goals.map(g => `${g.type}(p=${g.priority})`).join(", ")}`);
+  }
+
+  // 4. Compact fleet summary
+  const botSummaries = fleet.bots
+    .filter(b => b.status === "ready" || b.status === "running")
+    .map(b => {
+      const parts = [b.botId, b.routine ?? "idle", `${b.shipClass}`, `fuel=${b.fuelPct}%`];
+      if (b.role) parts.push(`role=${b.role}`);
+      return parts.join(" ");
+    });
+  sections.push(`FLEET (${fleet.bots.length} bots, ${fleet.totalCredits.toLocaleString()}cr):\n${botSummaries.map(s => `  ${s}`).join("\n")}`);
+
+  // 5. Economy (deficits only — surpluses are less actionable)
+  if (economy.deficits.length > 0) {
+    const defs = economy.deficits.slice(0, 5).map(d =>
+      `${d.itemId}: need ${d.demandPerHour}/hr, have ${d.supplyPerHour}/hr [${d.priority}]`
+    );
+    sections.push(`DEFICITS:\n${defs.map(d => `  - ${d}`).join("\n")}`);
+  }
+
+  return sections.join("\n\n");
+}
+
+
 function extractJson(raw: string): Record<string, unknown> {
   const text = raw.trim();
 
@@ -269,15 +388,27 @@ export function parseLlmResponse(
 
   if (Array.isArray(parsed.assignments)) {
     for (const a of parsed.assignments) {
-      if (
-        typeof a.botId === "string" &&
-        validBotIds.has(a.botId) &&
-        typeof a.routine === "string" &&
-        VALID_ROUTINES.includes(a.routine as RoutineName)
-      ) {
+      if (typeof a.botId !== "string" || typeof a.routine !== "string") continue;
+
+      // Exact match first, then fuzzy match for bot IDs
+      let resolvedBotId: string | null = validBotIds.has(a.botId) ? a.botId : null;
+      if (!resolvedBotId) {
+        resolvedBotId = fuzzyMatch(a.botId, validBotIds, 2);
+      }
+
+      // Exact match first, then fuzzy match for routine names
+      let resolvedRoutine: RoutineName | null = VALID_ROUTINES.includes(a.routine as RoutineName)
+        ? (a.routine as RoutineName)
+        : null;
+      if (!resolvedRoutine) {
+        const match = fuzzyMatch(a.routine, VALID_ROUTINES, 2);
+        if (match) resolvedRoutine = match as RoutineName;
+      }
+
+      if (resolvedBotId && resolvedRoutine) {
         assignments.push({
-          botId: a.botId,
-          routine: a.routine as RoutineName,
+          botId: resolvedBotId,
+          routine: resolvedRoutine,
           reasoning: typeof a.reasoning === "string" ? a.reasoning : "",
         });
       }

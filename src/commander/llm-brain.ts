@@ -104,8 +104,9 @@ export class LlmBrain implements CommanderBrain {
         // Try parsing — retry only on actual parse failures, not valid empty results
         try {
           const testParse = parseLlmResponse(responseText, validBotIds);
-          // Empty assignments with confidence > 0.5 = LLM intentionally returned no changes
-          if (testParse.assignments.length === 0 && input.fleet.bots.length > 0 && testParse.confidence < 0.5) {
+          // Empty assignments with high confidence = LLM intentionally returned no changes
+          // Default confidence is 0.5 when LLM omits it, so treat <= 0.5 as likely parse issue
+          if (testParse.assignments.length === 0 && input.fleet.bots.length > 0 && testParse.confidence <= 0.5) {
             lastParseError = `Parsed 0 assignments with low confidence (${testParse.confidence}) from ${responseText.length} chars.`;
             if (attempt < MAX_RETRIES) continue;
           }

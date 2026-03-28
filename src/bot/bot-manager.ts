@@ -369,6 +369,18 @@ export class BotManager {
               console.log(`[Galaxy] Hydrated ${enriched} POIs from ${persistedPois.length} persisted discoveries`);
             }
 
+            // Hydrate galaxy with persisted system details (full POI data from previous sessions)
+            const persistedSystems = this.services.cache.loadPersistedSystemDetails();
+            if (persistedSystems.length > 0) {
+              let poiBefore = this.services.galaxy.poiCount;
+              for (const sys of persistedSystems) {
+                if (sys.id && sys.pois.length > 0) {
+                  this.services.galaxy.updateSystem(sys);
+                }
+              }
+              console.log(`[Galaxy] Hydrated ${this.services.galaxy.poiCount - poiBefore} POIs from ${persistedSystems.length} persisted system details`);
+            }
+
             // Inject known strategic resource locations (e.g. energy crystals at Frontier Veil Nebula)
             for (const loc of KNOWN_RESOURCE_LOCATIONS) {
               const existing = this.services.galaxy.getPoi(loc.poiId);

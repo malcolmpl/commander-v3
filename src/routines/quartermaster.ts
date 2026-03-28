@@ -28,6 +28,7 @@ import {
   withdrawFromFaction,
   ensureMinCredits,
   depositExcessCredits,
+  fleetViewFactionStorage,
   MAX_MATERIAL_BUY_PRICE,
 } from "./helpers";
 
@@ -150,8 +151,8 @@ function buildPriceIndex(ctx: BotContext, excludeStation?: string): Map<string, 
 }
 
 /** Look up best known price for an item across ALL cached stations (including home). */
-function bestKnownPrice(ctx: BotContext, itemId: string): number {
-  const idx = buildPriceIndex(ctx);
+function bestKnownPrice(ctx: BotContext, itemId: string, priceIdx?: Map<string, PriceEntry>): number {
+  const idx = priceIdx ?? buildPriceIndex(ctx);
   const entry = idx.get(itemId);
   let best = 0;
   if (entry) {
@@ -267,13 +268,29 @@ export async function* quartermaster(ctx: BotContext): AsyncGenerator<RoutineYie
 
     if (ctx.shouldStop) return;
 
+    // ── Single faction storage fetch per cycle (was 4x!) ──
+    let factionStorage: Array<{ itemId: string; quantity: number }> = [];
+    try {
+      const { items: raw } = await fleetViewFactionStorage(ctx);
+      factionStorage = raw.filter((s) => s.quantity > 0);
+    } catch (err) {
+      yield `faction storage check failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+
+    // Build price index ONCE per cycle (was 2x: sales + buy orders)
+    const priceIndex = buildPriceIndex(ctx, homeBase);
+    // Build cost basis cache for this cycle (was O(n²) per item)
+    const costBasisCache = new Map<string, number>();
+
+    if (ctx.shouldStop) return;
+
     // ── 1. Sell faction goods at competitive prices ──
-    yield* manageFactionSales(ctx, homeBase, market, undercutPct, listedItems, oversizedItems, trackedSellOrders, adState);
+    yield* manageFactionSales(ctx, homeBase, market, undercutPct, listedItems, oversizedItems, trackedSellOrders, adState, factionStorage, priceIndex, costBasisCache);
 
     if (ctx.shouldStop) return;
 
     // ── 2. Buy equipment modules for fleet ──
-    yield* buyEquipmentModules(ctx, homeBase, market, moduleTarget);
+    yield* buyEquipmentModules(ctx, homeBase, market, moduleTarget, factionStorage);
 
     if (ctx.shouldStop) return;
 
@@ -286,13 +303,13 @@ export async function* quartermaster(ctx: BotContext): AsyncGenerator<RoutineYie
     // ── 4. Manage supply chain buy orders ──
     yield* manageMaterialBuyOrders(
       ctx, homeBase, market, trackedMaterialOrders,
-      buyOrderBudgetPct, maxOrderAge, adState,
+      buyOrderBudgetPct, maxOrderAge, adState, factionStorage, priceIndex,
     );
 
     if (ctx.shouldStop) return;
 
     // ── 5. Faction facility management (check & upgrade) ──
-    yield* manageFactionFacilities(ctx);
+    yield* manageFactionFacilities(ctx, factionStorage);
 
     if (ctx.shouldStop) return;
 
@@ -304,8 +321,8 @@ export async function* quartermaster(ctx: BotContext): AsyncGenerator<RoutineYie
     const maxCr = await depositExcessCredits(ctx);
     if (maxCr.message) yield maxCr.message;
 
-    // Moderate cycle — shorter sleep to capitalize on opportunities faster
-    await interruptibleSleep(ctx, 30_000);
+    // Quick cycle — QM is revenue-critical, must react to market changes fast
+    await interruptibleSleep(ctx, 15_000);
     yield typedYield("cycle_complete", { type: "cycle_complete", botId: ctx.botId, routine: "quartermaster" });
   }
 }
@@ -331,18 +348,11 @@ async function* manageFactionSales(
   oversizedItems: Set<string>,
   trackedSellOrders: Map<string, TrackedSellOrder>,
   adState: AdChatState,
+  storageItems: Array<{ itemId: string; quantity: number }>,
+  priceIndex: Map<string, PriceEntry>,
+  costBasisCache: Map<string, number>,
 ): AsyncGenerator<RoutineYield, void, void> {
   const now = Date.now();
-
-  // Get faction storage
-  let storageItems: Array<{ itemId: string; quantity: number }> = [];
-  try {
-    const storage = await ctx.api.viewFactionStorage();
-    storageItems = (storage ?? []).filter((s) => s.quantity > 0);
-  } catch (err) {
-    yield `faction storage check failed: ${err instanceof Error ? err.message : String(err)}`;
-    return;
-  }
 
   if (storageItems.length === 0) {
     yield "faction storage empty";
@@ -414,23 +424,15 @@ async function* manageFactionSales(
     return;
   }
 
-  // Log what we found sellable for debugging
-  const oresSellable = sellable.filter((s) => s.itemId.startsWith("ore_") || s.itemId.endsWith("_ore"));
-  const nonOresSellable = sellable.filter((s) => !(s.itemId.startsWith("ore_") || s.itemId.endsWith("_ore")));
-  if (oresSellable.length > 0) {
-    yield `sellable ores: ${oresSellable.map((s) => `${s.itemId}(${s.quantity})`).join(", ")}`;
-  }
-  if (nonOresSellable.length > 0) {
-    yield `sellable goods: ${nonOresSellable.map((s) => `${s.itemId}(${s.quantity})`).join(", ")}`;
+  // Log sellable items for debugging (ore is never sellable due to L369 filter)
+  if (sellable.length > 0) {
+    yield `sellable goods: ${sellable.map((s) => `${s.itemId}(${s.quantity})`).join(", ")}`;
   }
 
   // Get competing prices at other stations
   const cachedStationIds = ctx.cache.getAllMarketFreshness()
     .map((f) => f.stationId)
     .filter((id) => id !== homeBase);
-
-  // Build price index once for this sell cycle (avoids O(n²) per-item scans)
-  const priceIndex = buildPriceIndex(ctx, homeBase);
 
   // Check what we already have listed at our station
   const ourSellOrders = localMarket.filter(
@@ -497,13 +499,14 @@ async function* manageFactionSales(
     }
   }
 
-  // ── Cancel truly stale sell orders (>2 hours unfilled) ──
+  // ── Cancel stale sell orders (>30min unfilled — was 2hr, too conservative) ──
+  // Shorter timeout frees listing slots for new items faster
   let cancelActions = 0;
   for (const [orderId, tracked] of trackedSellOrders) {
-    if (ctx.shouldStop || cancelActions >= 2) break;
+    if (ctx.shouldStop || cancelActions >= 3) break;
 
     const age = now - tracked.placedAt;
-    if (age < 7_200_000) continue; // < 2 hours — keep trying
+    if (age < 1_800_000) continue; // < 30 min — keep trying
 
     try {
       await ctx.api.cancelOrder(orderId);
@@ -511,7 +514,7 @@ async function* manageFactionSales(
       listedItems.delete(tracked.itemId);
       trackedSellOrders.delete(orderId);
       cancelActions++;
-      yield `cancelled stale sell order: ${tracked.quantity}x ${tracked.itemName} @ ${tracked.priceEach}cr (>2h unfilled)`;
+      yield `cancelled stale sell order: ${tracked.quantity}x ${tracked.itemName} @ ${tracked.priceEach}cr (>30min unfilled)`;
     } catch (err) {
       yield `cancel sell order failed: ${err instanceof Error ? err.message : String(err)}`;
     }
@@ -528,15 +531,21 @@ async function* manageFactionSales(
     if (oversizedItems.has(item.itemId)) continue;
 
     const itemName = ctx.crafting.getItemName(item.itemId) || item.itemId;
-    const costBasis = estimateCostBasis(ctx, item.itemId);
+
+    // Use cached cost basis (avoids repeated getAllRecipes() scans)
+    let costBasis = costBasisCache.get(item.itemId);
+    if (costBasis === undefined) {
+      costBasis = estimateCostBasis(ctx, item.itemId);
+      costBasisCache.set(item.itemId, costBasis);
+    }
 
     if (costBasis <= 0) {
       // Fallback: use any known market price as cost basis
-      const fallbackCost = bestKnownPrice(ctx, item.itemId);
+      const fallbackCost = bestKnownPrice(ctx, item.itemId, priceIndex);
       if (fallbackCost <= 0) continue; // Truly unknown — can't price it
     }
 
-    const effectiveCostBasis = costBasis > 0 ? costBasis : bestKnownPrice(ctx, item.itemId);
+    const effectiveCostBasis = costBasis > 0 ? costBasis : bestKnownPrice(ctx, item.itemId, priceIndex);
 
     const priceResult = calculateSellPrice(ctx, item.itemId, effectiveCostBasis, cachedStationIds, homeBase, undercutPct, priceIndex);
     if (!priceResult) continue;
@@ -626,6 +635,7 @@ async function* manageFactionSales(
         if (remaining > 0) {
           try {
             await ctx.api.factionDepositItems(item.itemId, remaining);
+            ctx.cache.invalidateFactionStorage();
             await ctx.refreshState();
           } catch { /* best effort */ }
         }
@@ -642,6 +652,7 @@ async function* manageFactionSales(
           // Re-deposit to faction storage first, then create faction sell order
           try {
             await ctx.api.factionDepositItems(item.itemId, sellQty);
+            ctx.cache.invalidateFactionStorage();
             await ctx.refreshState();
           } catch { /* best effort — may already be deposited */ }
 
@@ -687,6 +698,7 @@ async function* manageFactionSales(
           // Not worth listing — re-deposit to faction storage
           try {
             await ctx.api.factionDepositItems(item.itemId, sellQty);
+            ctx.cache.invalidateFactionStorage();
             await ctx.refreshState();
           } catch { /* best effort */ }
           yield `${itemName} — no demand, per-unit value too low (${listPrice}cr/ea)`;
@@ -702,6 +714,7 @@ async function* manageFactionSales(
       if (leftover > 0) {
         try {
           await ctx.api.factionDepositItems(item.itemId, leftover);
+          ctx.cache.invalidateFactionStorage();
           await ctx.refreshState();
         } catch { /* best effort */ }
       }
@@ -709,7 +722,40 @@ async function* manageFactionSales(
   }
 
   if (ordersCreated === 0 && sellable.length > 0) {
-    yield `${sellable.length} sellable item(s) in faction — no profitable listings found`;
+    // Check if any sellable items have demand at OTHER stations (cross-station intel)
+    const remoteDemand: Array<{ itemId: string; stationId: string; price: number; volume: number }> = [];
+    const allFreshness = ctx.cache.getAllMarketFreshness();
+    for (const item of sellable) {
+      for (const { stationId } of allFreshness) {
+        if (stationId === homeBase) continue;
+        const prices = ctx.cache.getMarketPrices(stationId);
+        if (!prices) continue;
+        const match = prices.find((p) => p.itemId === item.itemId && p.sellPrice && p.sellPrice > 0 && p.sellVolume > 0);
+        if (match) {
+          remoteDemand.push({ itemId: item.itemId, stationId, price: match.sellPrice!, volume: match.sellVolume });
+        }
+      }
+    }
+
+    if (remoteDemand.length > 0) {
+      // Deduplicate: best price per item
+      const bestByItem = new Map<string, { stationId: string; price: number; volume: number }>();
+      for (const rd of remoteDemand) {
+        const existing = bestByItem.get(rd.itemId);
+        if (!existing || rd.price > existing.price) {
+          bestByItem.set(rd.itemId, rd);
+        }
+      }
+      const tips = [...bestByItem.entries()]
+        .sort((a, b) => b[1].price * b[1].volume - a[1].price * a[1].volume)
+        .slice(0, 5);
+      yield `${sellable.length} sellable item(s) — no local buyers, but ${bestByItem.size} item(s) have remote demand:`;
+      for (const [itemId, info] of tips) {
+        yield `  → ${itemId} @ ${info.price}cr (${info.volume} wanted) at ${info.stationId.replace(/_/g, " ")}`;
+      }
+    } else {
+      yield `${sellable.length} sellable item(s) in faction — no profitable listings found (local or remote)`;
+    }
   }
 }
 
@@ -723,18 +769,11 @@ async function* manageFactionSales(
  */
 async function* buyEquipmentModules(
   ctx: BotContext,
-  homeBase: string,
+  _homeBase: string,
   localMarket: MarketOrder[],
   targetCount: number,
+  storageItems: Array<{ itemId: string; quantity: number }>,
 ): AsyncGenerator<RoutineYield, void, void> {
-  // Check faction storage for existing modules
-  let storageItems: Array<{ itemId: string; quantity: number }> = [];
-  try {
-    const storage = await ctx.api.viewFactionStorage();
-    storageItems = (storage ?? []).filter((s) => s.quantity > 0);
-  } catch {
-    return;
-  }
 
   // Count modules per target type (faction storage + equipped on fleet bots)
   const fleet = ctx.getFleetStatus();
@@ -807,6 +846,7 @@ async function* buyEquipmentModules(
             // Deposit to faction storage
             try {
               await ctx.api.factionDepositItems(cheapest.itemId, 1);
+              ctx.cache.invalidateFactionStorage();
               await ctx.refreshState();
               yield `bought & stored 1x ${target.label} @ ${result.priceEach || cheapest.priceEach}cr (${target.count + 1}/${target.target})`;
             } catch {
@@ -838,17 +878,23 @@ async function* collectFilledOrders(
   ctx: BotContext,
 ): AsyncGenerator<RoutineYield, void, void> {
   await ctx.refreshState();
-  for (const item of ctx.ship.cargo) {
+  const moduleItems = ctx.ship.cargo.filter(item => isModuleItem(item.itemId));
+  if (moduleItems.length === 0) return;
+
+  let deposited = 0;
+  for (const item of moduleItems) {
     if (ctx.shouldStop) return;
-    if (!isModuleItem(item.itemId)) continue;
     try {
       await ctx.api.factionDepositItems(item.itemId, item.quantity);
-      await ctx.refreshState();
+      ctx.cache.invalidateFactionStorage();
+      deposited++;
       yield `deposited ${item.quantity}x ${item.itemId} to faction storage (filled order)`;
     } catch (err) {
       yield `deposit failed for ${item.itemId}: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
+  // Single refreshState after all deposits (was 1 per item)
+  if (deposited > 0) await ctx.refreshState();
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -864,19 +910,18 @@ async function* collectFilledOrders(
  */
 async function* manageMaterialBuyOrders(
   ctx: BotContext,
-  homeBase: string,
-  localMarket: MarketOrder[],
+  _homeBase: string,
+  _localMarket: MarketOrder[],
   tracked: Map<string, MaterialBuyOrder>,
   budgetPct: number,
   maxAge: number,
   adState: AdChatState,
+  storageItems: Array<{ itemId: string; quantity: number }>,
+  buyPriceIndex: Map<string, PriceEntry>,
 ): AsyncGenerator<RoutineYield, void, void> {
   const now = Date.now();
   let actionsThisCycle = 0;
   const MAX_ACTIONS = 4;
-
-  // Build price index once for all buy-price calculations this cycle
-  const buyPriceIndex = buildPriceIndex(ctx);
 
   // ── Reconcile: check current orders vs tracked ──
   let myBuyOrders: MarketOrder[] = [];
@@ -919,19 +964,26 @@ async function* manageMaterialBuyOrders(
 
   // Deposit any non-module material items in cargo to faction storage (from filled orders)
   await ctx.refreshState();
-  for (const item of ctx.ship.cargo) {
+  const materialsInCargo = ctx.ship.cargo.filter(item =>
+    !isModuleItem(item.itemId)
+    && !item.itemId.startsWith("ore_")
+    && !item.itemId.endsWith("_ore")
+  );
+  let matDeposits = 0;
+  for (const item of materialsInCargo) {
     if (ctx.shouldStop) return;
-    if (isModuleItem(item.itemId)) continue; // Handled by collectFilledOrders
-    if (item.itemId.startsWith("ore_") || item.itemId.endsWith("_ore")) continue;
     try {
       await ctx.api.factionDepositItems(item.itemId, item.quantity);
-      await ctx.refreshState();
+      ctx.cache.invalidateFactionStorage();
+      matDeposits++;
       const itemName = ctx.crafting.getItemName(item.itemId) || item.itemId;
       yield `deposited ${item.quantity}x ${itemName} to faction (from buy order)`;
     } catch (err) {
       yield `deposit failed for ${item.itemId}: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
+  // Single refreshState after all material deposits (was 1 per item)
+  if (matDeposits > 0) await ctx.refreshState();
 
   // Update tracking for partially filled orders
   for (const order of myBuyOrders) {
@@ -943,14 +995,11 @@ async function* manageMaterialBuyOrders(
     }
   }
 
-  // ── Get faction storage for stock checks ──
-  let factionStock = new Map<string, number>();
-  try {
-    const storage = await ctx.api.viewFactionStorage();
-    for (const s of storage ?? []) {
-      if (s.quantity > 0) factionStock.set(s.itemId, s.quantity);
-    }
-  } catch { /* proceed with empty stock */ }
+  // Use shared faction storage snapshot (fetched once per cycle)
+  const factionStock = new Map<string, number>();
+  for (const s of storageItems) {
+    factionStock.set(s.itemId, s.quantity);
+  }
 
   // ── Cancel stale orders ──
   for (const [orderId, order] of tracked) {
@@ -1091,7 +1140,7 @@ async function* manageMaterialBuyOrders(
 function identifyBuyOrderTargets(
   ctx: BotContext,
   factionStock: Map<string, number>,
-  budget: number,
+  _budget: number,
   priceIdx?: Map<string, PriceEntry>,
 ): BuyOrderTarget[] {
   const recipes = ctx.crafting.getAllRecipes();
@@ -1287,6 +1336,7 @@ function calculateBuyPrice(
  */
 async function* manageFactionFacilities(
   ctx: BotContext,
+  sharedStorage: Array<{ itemId: string; quantity: number }>,
 ): AsyncGenerator<RoutineYield, void, void> {
   if (!ctx.player.dockedAtBase) return;
 
@@ -1300,7 +1350,7 @@ async function* manageFactionFacilities(
   // Check faction treasury
   let factionCredits = 0;
   try {
-    factionCredits = await ctx.api.viewFactionStorageCredits();
+    factionCredits = (await fleetViewFactionStorage(ctx)).credits;
   } catch { /* ok */ }
 
   // List existing faction facilities at this station
@@ -1313,12 +1363,8 @@ async function* manageFactionFacilities(
     facilities.map(f => String(f.type ?? f.facility_type ?? ""))
   );
 
-  // ── Gather faction storage for material deficit calculation ──
-  let storageItems: Array<{ itemId: string; quantity: number }> = [];
-  try {
-    storageItems = (await ctx.api.viewFactionStorage()) ?? [];
-  } catch { /* ok */ }
-  const storageMap = new Map(storageItems.map(s => [s.itemId, s.quantity]));
+  // Use shared faction storage snapshot (fetched once per cycle)
+  const storageMap = new Map(sharedStorage.map(s => [s.itemId, s.quantity]));
 
   // Accumulate material needs across all queued facilities
   const allMaterialNeeds = new Map<string, number>();
@@ -1373,15 +1419,51 @@ async function* manageFactionFacilities(
       continue;
     }
 
-    // Check if we have enough materials (skip build attempt if short)
+    // Check if we have enough materials — try to buy missing ones from market
     const missingMats = materials.filter(m => (storageMap.get(m.itemId) ?? 0) < m.quantity);
     if (missingMats.length > 0) {
-      const matList = missingMats.map(m => {
-        const have = storageMap.get(m.itemId) ?? 0;
-        return `${ctx.crafting.getItemName(m.itemId)}: ${have}/${m.quantity}`;
-      }).join(", ");
-      yield `${facilityType.replace(/_/g, " ")} needs materials: ${matList}`;
-      continue;
+      // Attempt to buy missing materials from local market
+      let allAcquired = true;
+      for (const mat of missingMats) {
+        const have = storageMap.get(mat.itemId) ?? 0;
+        const need = mat.quantity - have;
+        if (need <= 0) continue;
+
+        try {
+          const est = await ctx.api.estimatePurchase(mat.itemId, need);
+          const available = (est as any).available ?? 0;
+          const cost = (est as any).total_cost ?? 0;
+          // Buy if available and affordable (max 30% of faction credits)
+          if (available > 0 && cost < factionCredits * 0.3) {
+            const buyQty = Math.min(available, need);
+            await ctx.api.buy(mat.itemId, buyQty);
+            await ctx.refreshState();
+            // Deposit to faction storage
+            await ctx.api.factionDepositItems(mat.itemId, buyQty);
+            await ctx.refreshState();
+            storageMap.set(mat.itemId, (storageMap.get(mat.itemId) ?? 0) + buyQty);
+            yield `bought ${buyQty}x ${ctx.crafting.getItemName(mat.itemId)} for facility (${cost}cr)`;
+          } else if (available === 0) {
+            allAcquired = false;
+          } else {
+            allAcquired = false;
+            yield `${ctx.crafting.getItemName(mat.itemId)} too expensive: ${cost}cr for ${available} units`;
+          }
+        } catch {
+          allAcquired = false;
+        }
+      }
+
+      // Re-check after buying
+      const stillMissing = materials.filter(m => (storageMap.get(m.itemId) ?? 0) < m.quantity);
+      if (stillMissing.length > 0) {
+        const matList = stillMissing.map(m => {
+          const have = storageMap.get(m.itemId) ?? 0;
+          return `${ctx.crafting.getItemName(m.itemId)}: ${have}/${m.quantity}`;
+        }).join(", ");
+        yield `${facilityType.replace(/_/g, " ")} still needs materials: ${matList}`;
+        continue;
+      }
     }
 
     yield `building ${facilityType.replace(/_/g, " ")}${buildCost > 0 ? ` (${buildCost}cr)` : ""}`;
@@ -1476,10 +1558,42 @@ async function* manageFactionFacilities(
 
     // Refresh credits if we haven't checked yet
     if (factionCredits === 0) {
-      try { factionCredits = await ctx.api.viewFactionStorageCredits(); } catch { /* ok */ }
+      try { factionCredits = (await fleetViewFactionStorage(ctx)).credits; } catch { /* ok */ }
     }
 
     if (upgradeCost > 0 && factionCredits >= upgradeCost * 2) {
+      // Check and buy materials for the upgrade
+      const upgradeMats = (nextUpgrade.materials ?? nextUpgrade.build_materials ?? []) as Array<Record<string, unknown>>;
+      for (const rawMat of upgradeMats) {
+        const matId = String(rawMat.item_id ?? rawMat.itemId ?? "");
+        const matQty = Number(rawMat.quantity ?? rawMat.amount ?? 0);
+        if (!matId || matQty <= 0) continue;
+        const inStorage = storageMap.get(matId) ?? 0;
+        const deficit = matQty - inStorage;
+        if (deficit <= 0) continue;
+
+        // Track as facility need
+        allMaterialNeeds.set(matId, (allMaterialNeeds.get(matId) ?? 0) + deficit);
+
+        // Try to buy from market
+        try {
+          const est = await ctx.api.estimatePurchase(matId, deficit);
+          const available = (est as any).available ?? 0;
+          const cost = (est as any).total_cost ?? 0;
+          if (available > 0 && cost < factionCredits * 0.3) {
+            const buyQty = Math.min(available, deficit);
+            await ctx.api.buy(matId, buyQty);
+            await ctx.refreshState();
+            await ctx.api.factionDepositItems(matId, buyQty);
+            await ctx.refreshState();
+            storageMap.set(matId, inStorage + buyQty);
+            yield `bought ${buyQty}x ${ctx.crafting.getItemName(matId)} for upgrade (${cost}cr)`;
+          }
+        } catch { /* market buy failed — ok */ }
+      }
+      // Update facility needs in cache
+      ctx.cache.setFacilityMaterialNeeds(allMaterialNeeds);
+
       yield `upgrading ${facName} (Lv${facLevel} → Lv${upgradeLevel}) for ${upgradeCost}cr`;
       try {
         await ctx.api.factionFacilityUpgrade(facId, upgradeType || undefined);
@@ -1524,25 +1638,29 @@ export function calculateSellPrice(
     return null;
   }
 
-  // Calculate list price: undercut competitors to attract buyers
-  let listPrice: number;
-  if (cheapestElsewhere < Infinity) {
-    listPrice = Math.floor(cheapestElsewhere * (1 - undercutPct));
-  } else if (bestDemandPrice > 0) {
-    listPrice = Math.floor(bestDemandPrice * (1 - undercutPct / 2));
-  } else {
-    listPrice = Math.ceil(costBasis * 1.25);
-  }
-
-  // Insight-aware pricing: reduce undercut when demand is confirmed
+  // Insight-aware pricing: boost base price BEFORE undercutting when demand is confirmed
+  // This preserves more margin than applying premium after undercut
+  let demandBoost = 1.0;
   const stationInsights = ctx.cache.getMarketInsights(homeBase);
   if (stationInsights) {
     const demandInsight = stationInsights.find(
       (i) => i.item_id === itemId && (i.category === "demand" || i.category === "arbitrage")
     );
     if (demandInsight && demandInsight.priority >= 5) {
-      listPrice = Math.ceil(listPrice * 1.10); // +10% premium for high-demand items
+      demandBoost = 1.15; // +15% premium for high-demand items (applied before undercut)
+    } else if (demandInsight && demandInsight.priority >= 3) {
+      demandBoost = 1.08; // +8% for moderate demand
     }
+  }
+
+  // Calculate list price: apply demand boost first, then undercut competitors
+  let listPrice: number;
+  if (cheapestElsewhere < Infinity) {
+    listPrice = Math.floor(cheapestElsewhere * demandBoost * (1 - undercutPct));
+  } else if (bestDemandPrice > 0) {
+    listPrice = Math.floor(bestDemandPrice * demandBoost * (1 - undercutPct / 2));
+  } else {
+    listPrice = Math.ceil(costBasis * 1.25 * demandBoost);
   }
 
   // Floor: at least cost basis (break even)

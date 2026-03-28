@@ -51,8 +51,21 @@ export const SHIP_DEALER_MAX_WALLET_PCT = 0.60;   // max fraction of wallet to s
 // Resources critical for supply chain progression (e.g. circuit boards → tier II modules).
 // When storage is below the threshold, nebula/belt scoring gets a large demand boost.
 export const STRATEGIC_RESOURCES: Array<{ itemId: string; poiTypes: string[]; minStock: number; boostScore: number }> = [
-  { itemId: "energy_crystal", poiTypes: ["nebula", "gas_cloud"], minStock: 200, boostScore: 500 },
+  { itemId: "energy_crystal", poiTypes: ["nebula", "gas_cloud"], minStock: 500, boostScore: 800 },
+  { itemId: "silicon_ore", poiTypes: ["asteroid_belt", "asteroid"], minStock: 500, boostScore: 600 },  // Critical for circuit boards
   { itemId: "phase_crystal", poiTypes: ["nebula", "gas_cloud"], minStock: 50, boostScore: 100 },
+  { itemId: "focused_crystal", poiTypes: [], minStock: 20, boostScore: 200 },  // Needed for Hyper ML3, ML2
+  { itemId: "circuit_board", poiTypes: [], minStock: 50, boostScore: 300 },  // Needed for ML1, filters, power cells
+  { itemId: "superconductor", poiTypes: [], minStock: 20, boostScore: 200 },  // Needed for Strip Miner, filters
+  { itemId: "power_core", poiTypes: [], minStock: 10, boostScore: 200 },  // Needed for ML5, Strip Miner, filters
+  { itemId: "steel_plate", poiTypes: [], minStock: 100, boostScore: 100 },  // Base material for many modules
+  { itemId: "flex_polymer", poiTypes: [], minStock: 50, boostScore: 100 },  // Needed for Cargo Expanders, filters
+  { itemId: "titanium_alloy", poiTypes: [], minStock: 50, boostScore: 200 },  // Shipyard component — huge demand
+  { itemId: "hull_plating", poiTypes: [], minStock: 30, boostScore: 150 },  // Shipyard component
+  { itemId: "engine_core", poiTypes: [], minStock: 15, boostScore: 150 },  // Shipyard component
+  { itemId: "sensor_array", poiTypes: [], minStock: 20, boostScore: 150 },  // Shipyard component
+  { itemId: "processing_core", poiTypes: [], minStock: 10, boostScore: 150 },  // Shipyard component
+  { itemId: "durasteel_plate", poiTypes: [], minStock: 20, boostScore: 150 },  // Shipyard component
 ];
 
 // Known strategic resource locations — injected into galaxy on startup if not already known

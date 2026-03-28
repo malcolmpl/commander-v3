@@ -130,6 +130,14 @@ export class TieredBrain implements CommanderBrain {
     return this.lastUsedBrain;
   }
 
+  /** Get a tier brain by name prefix (e.g., "ollama" matches "ollama/qwen3:8b") */
+  getTierByPrefix(prefix: string): CommanderBrain | undefined {
+    return this.tiers.find(b => {
+      const name = b.getHealth?.()?.name ?? (b as any).name ?? "";
+      return name.startsWith(prefix);
+    });
+  }
+
   private async runShadow(input: EvaluationInput, primary: EvaluationOutput): Promise<void> {
     try {
       const shadow = await this.shadowBrain!.evaluate(input);

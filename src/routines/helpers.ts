@@ -120,9 +120,10 @@ export async function navigateTo(
     const jumpsNeeded = path.length - 1;
     log(ctx, `navigating ${ctx.player.currentSystem} → ${targetSystemId} (${jumpsNeeded} jump(s))`);
 
-    // Pre-flight fuel check: ensure we have enough fuel for the full route
-    // Each jump costs ~1 fuel. Require fuel for the route + safety margin for return.
-    if (ctx.ship.fuel < jumpsNeeded + FUEL_SAFETY_MARGIN) {
+    // Pre-flight fuel check: physics-based estimate (mass/speed/cargo affect fuel cost)
+    const fuelPerJump = ctx.nav.estimateJumpFuel(ctx.ship);
+    const fuelNeeded = jumpsNeeded * fuelPerJump + FUEL_SAFETY_MARGIN;
+    if (ctx.ship.fuel < fuelNeeded) {
       // Try to dock and refuel first
       if (!ctx.player.dockedAtBase) {
         const canDock = ctx.station.canDock(ctx.player);
@@ -134,11 +135,15 @@ export async function navigateTo(
             await ctx.api.undock();
             await ctx.refreshState();
           } catch (err) { logWarn(ctx, `pre-flight refuel dock failed: ${err instanceof Error ? err.message : err}`); }
+        } else {
+          // Undocked and can't dock — try burning cargo fuel cells
+          await burnFuelCells(ctx);
         }
       }
       // Re-check after refuel attempt
-      if (ctx.ship.fuel < jumpsNeeded + FUEL_SAFETY_MARGIN) {
-        throw new Error(`Insufficient fuel: need ${jumpsNeeded + FUEL_SAFETY_MARGIN}, have ${ctx.ship.fuel}. Route: ${jumpsNeeded} jumps to ${targetSystemId}`);
+      const fuelNeededRecheck = jumpsNeeded * ctx.nav.estimateJumpFuel(ctx.ship) + FUEL_SAFETY_MARGIN;
+      if (ctx.ship.fuel < fuelNeededRecheck) {
+        throw new Error(`Insufficient fuel: need ${fuelNeededRecheck}, have ${ctx.ship.fuel}. Route: ${jumpsNeeded} jumps to ${targetSystemId}`);
       }
     }
 
@@ -161,16 +166,22 @@ export async function navigateTo(
       }
 
       log(ctx, `jumping to ${path[i]} (${i}/${jumpsNeeded})`);
-      await ctx.api.jump(path[i]);
+      try {
+        await ctx.api.jump(path[i]);
+      } catch (jumpErr) {
+        const msg = jumpErr instanceof Error ? jumpErr.message : String(jumpErr);
+        // "already_here" means we're already in this system — skip to next jump
+        if (msg.includes("already_here") || msg.includes("already in")) {
+          log(ctx, `already in ${path[i]}, skipping`);
+          continue;
+        }
+        throw jumpErr;
+      }
       await ctx.refreshState();
 
-      // Auto-update galaxy with detailed system data (getSystem is a free query)
+      // Auto-update galaxy with detailed system data (fleet-deduped)
       try {
-        const systemDetail = await ctx.api.getSystem();
-        if (systemDetail?.id) {
-          ctx.galaxy.updateSystem(systemDetail);
-          ctx.cache.setSystemDetail(systemDetail.id, systemDetail);
-        }
+        await fleetGetSystem(ctx);
       } catch (err) {
         logWarn(ctx, `failed to update system detail after jump: ${err instanceof Error ? err.message : err}`);
       }
@@ -188,8 +199,17 @@ export async function navigateTo(
  * Navigate to a POI by ID, resolving the system automatically.
  */
 export async function navigateToPoi(ctx: BotContext, poiId: string): Promise<void> {
-  const systemId = ctx.galaxy.getSystemForPoi(poiId);
-  if (!systemId) throw new Error(`Unknown POI: ${poiId}`);
+  let systemId = ctx.galaxy.getSystemForPoi(poiId);
+
+  // Fallback: POI not in galaxy cache — refresh current system detail (fleet-deduped)
+  if (!systemId) {
+    try {
+      await fleetGetSystem(ctx);
+      systemId = ctx.galaxy.getSystemForPoi(poiId);
+    } catch { /* ignore */ }
+    if (!systemId) throw new Error(`Unknown POI: ${poiId}`);
+  }
+
   await navigateTo(ctx, systemId, poiId);
 }
 
@@ -205,11 +225,7 @@ export async function ensureSystemDetail(ctx: BotContext): Promise<void> {
   if (system && system.pois.length > 0) return; // Already have POI data
 
   try {
-    const detail = await ctx.api.getSystem();
-    if (detail?.id) {
-      ctx.galaxy.updateSystem(detail);
-      ctx.cache.setSystemDetail(detail.id, detail);
-    }
+    await fleetGetSystem(ctx);
   } catch (err) {
     logWarn(ctx, `failed to fetch system detail for ${ctx.player.currentSystem}: ${err instanceof Error ? err.message : err}`);
   }
@@ -227,22 +243,12 @@ export async function dockAtCurrent(ctx: BotContext): Promise<void> {
     // Already docked — still scan market/shipyard if cache is stale (e.g., after restart)
     if (!ctx.cache.getMarketPrices(ctx.player.dockedAtBase)) {
       try {
-        const orders = await ctx.api.viewMarket();
-        if (orders.length > 0) cacheMarketData(ctx, ctx.player.dockedAtBase, orders);
+        await fleetViewMarket(ctx, ctx.player.dockedAtBase);
       } catch (err) { logWarn(ctx, `market scan failed (cached dock): ${err instanceof Error ? err.message : err}`); }
     }
     if (!ctx.cache.getShipyardData(ctx.player.dockedAtBase)) {
       try {
-        const showroom = await ctx.api.shipyardShowroom();
-        if (showroom.length > 0) {
-          const ships = showroom.map((s) => ({
-            id: String(s.id ?? s.ship_id ?? ""),
-            name: String(s.name ?? s.ship_name ?? "Unknown"),
-            classId: String(s.class_id ?? s.ship_class ?? s.classId ?? ""),
-            price: Number(s.price ?? s.cost ?? 0),
-          }));
-          ctx.cache.setShipyardData(ctx.player.dockedAtBase, ships);
-        }
+        await fleetShipyardShowroom(ctx, ctx.player.dockedAtBase);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("unknown_command") && !msg.includes("Unknown command")) {
@@ -269,28 +275,16 @@ export async function dockAtCurrent(ctx: BotContext): Promise<void> {
     await refuelIfNeeded(ctx);
     await repairIfNeeded(ctx);
 
-    // Auto-scan market to build intel (viewMarket is a free query)
+    // Auto-scan market to build intel (fleet-deduped)
     try {
-      const orders = await ctx.api.viewMarket();
-      if (orders.length > 0) {
-        cacheMarketData(ctx, ctx.player.dockedAtBase, orders);
-      }
+      await fleetViewMarket(ctx, ctx.player.dockedAtBase);
     } catch (err) {
       logWarn(ctx, `market scan failed at ${ctx.player.dockedAtBase}: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Scan shipyard to cache available ships
+    // Scan shipyard to cache available ships (fleet-deduped)
     try {
-      const showroom = await ctx.api.shipyardShowroom();
-      if (showroom.length > 0) {
-        const ships = showroom.map((s) => ({
-          id: String(s.id ?? s.ship_id ?? ""),
-          name: String(s.name ?? s.ship_name ?? "Unknown"),
-          classId: String(s.class_id ?? s.ship_class ?? s.classId ?? ""),
-          price: Number(s.price ?? s.cost ?? 0),
-        }));
-        ctx.cache.setShipyardData(ctx.player.dockedAtBase, ships);
-      }
+      await fleetShipyardShowroom(ctx, ctx.player.dockedAtBase);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Suppress "unknown_command" — station has no shipyard (not an error)
@@ -311,8 +305,33 @@ export async function dockAtCurrent(ctx: BotContext): Promise<void> {
 export async function navigateAndDock(ctx: BotContext, baseId: string): Promise<void> {
   if (ctx.player.dockedAtBase === baseId) return;
 
-  const systemId = ctx.galaxy.getSystemForBase(baseId);
-  if (!systemId) throw new Error(`Unknown base: ${baseId}`);
+  let systemId = ctx.galaxy.getSystemForBase(baseId);
+
+  // Fallback: base not in galaxy cache — scan current system or search for it
+  if (!systemId) {
+    // Try refreshing current system detail (maybe we're already in the right system)
+    try {
+      await fleetGetSystem(ctx);
+      systemId = ctx.galaxy.getSystemForBase(baseId);
+    } catch { /* ignore */ }
+
+    // Try searching for the base name
+    if (!systemId) {
+      try {
+        const results = await ctx.api.searchSystems(baseId.replace(/_/g, " "));
+        for (const raw of results) {
+          const sys = raw as any;
+          if (sys.id && sys.pois?.length > 0) {
+            const normalized = { id: sys.id, name: sys.name, x: sys.x ?? 0, y: sys.y ?? 0, connections: sys.connections ?? [], pois: sys.pois };
+            ctx.galaxy.updateSystem(normalized as any);
+          }
+        }
+        systemId = ctx.galaxy.getSystemForBase(baseId);
+      } catch { /* ignore search failure */ }
+    }
+
+    if (!systemId) throw new Error(`Unknown base: ${baseId}`);
+  }
 
   // Find the POI that has this base
   const system = ctx.galaxy.getSystem(systemId);
@@ -359,8 +378,7 @@ export async function findAndDock(ctx: BotContext): Promise<void> {
       await refuelIfNeeded(ctx);
       await repairIfNeeded(ctx);
       try {
-        const orders = await ctx.api.viewMarket();
-        if (orders.length > 0) cacheMarketData(ctx, ctx.player.dockedAtBase, orders);
+        await fleetViewMarket(ctx, ctx.player.dockedAtBase);
       } catch (err) { logWarn(ctx, `market scan failed: ${err instanceof Error ? err.message : err}`); }
       return;
     }
@@ -682,14 +700,9 @@ export async function ensureFuelSafety(ctx: BotContext): Promise<void> {
 export async function analyzeMarketIfStale(ctx: BotContext): Promise<void> {
   const baseId = ctx.player.dockedAtBase;
   if (!baseId) return;
-  if (ctx.cache.hasFreshInsights(baseId)) return;
 
   try {
-    const result = await ctx.api.analyzeMarket(baseId);
-    if (result.insights.length > 0) {
-      ctx.cache.setMarketInsights(baseId, result.insights);
-      log(ctx, `market analysis: ${result.insights.length} insights (skill ${result.skill_level})`);
-    }
+    await fleetAnalyzeMarket(ctx, baseId);
   } catch (err) {
     logWarn(ctx, `analyze_market failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -788,6 +801,7 @@ export async function depositItem(ctx: BotContext, itemId: string): Promise<void
 
   if (useFaction) {
     await ctx.api.factionDepositItems(itemId, qty);
+    ctx.cache.invalidateFactionStorage();
     ctx.eventBus.emit({
       type: "deposit", botId: ctx.botId, itemId, quantity: qty,
       target: "faction", stationId: ctx.player.dockedAtBase ?? "",
@@ -804,6 +818,7 @@ export async function depositItem(ctx: BotContext, itemId: string): Promise<void
  */
 export async function withdrawFromFaction(ctx: BotContext, itemId: string, quantity: number): Promise<void> {
   await ctx.api.factionWithdrawItems(itemId, quantity);
+  ctx.cache.invalidateFactionStorage();
   ctx.eventBus.emit({
     type: "withdraw", botId: ctx.botId, itemId, quantity,
     source: "faction", stationId: ctx.player.dockedAtBase ?? "",
@@ -832,6 +847,7 @@ export async function disposeCargo(ctx: BotContext): Promise<SellResult> {
       try {
         if (mode === "faction_deposit") {
           await ctx.api.factionDepositItems(item.itemId, qty);
+          ctx.cache.invalidateFactionStorage();
           ctx.eventBus.emit({
             type: "deposit", botId: ctx.botId, itemId: item.itemId, quantity: qty,
             target: "faction", stationId: ctx.player.dockedAtBase ?? "",
@@ -1077,14 +1093,20 @@ export async function* mineUntilFull(
 /**
  * Aggregate MarketOrder[] into MarketPrice[] and cache for the station.
  * Call this whenever a routine fetches market orders to feed the market pipeline.
+ * Excludes bot's own orders so we don't compete against ourselves in pricing/volume.
  */
 export function cacheMarketData(ctx: BotContext, stationId: string, orders: MarketOrder[]): void {
   if (!stationId || orders.length === 0) return;
 
+  // Filter out bot's own orders — we don't want to see our own sell orders as "supply"
+  // or our own buy orders as "demand" when computing market prices
+  const ownPlayerId = ctx.player.id;
+  const externalOrders = orders.filter(o => o.playerId !== ownPlayerId);
+
   // Group orders by item
   const byItem = new Map<string, { name: string; sells: { price: number; qty: number }[]; buys: { price: number; qty: number }[] }>();
 
-  for (const order of orders) {
+  for (const order of externalOrders) {
     if (!byItem.has(order.itemId)) {
       byItem.set(order.itemId, { name: order.itemName, sells: [], buys: [] });
     }
@@ -1198,6 +1220,103 @@ export function adjustMarketCache(
   }
 
   ctx.cache.setMarketPrices(stationId, prices, Math.floor(Date.now() / 1000));
+}
+
+// ── Fleet-wide Query Dedup Wrappers ──
+// These prevent redundant API calls when multiple bots are at the same station/system.
+// In-flight requests are coalesced, and recently-fetched data is reused.
+
+/**
+ * Fleet-deduped viewMarket. If another bot fetched this station's market within 60s,
+ * returns cached orders (empty array signals "use cache"). Coalesces in-flight requests.
+ * Always caches the result for the fleet.
+ */
+export async function fleetViewMarket(
+  ctx: BotContext, stationId: string, category?: string,
+): Promise<MarketOrder[]> {
+  // Category-filtered queries bypass dedup (rare, targeted calls like "module" filter)
+  if (category) return ctx.api.viewMarket(undefined, category);
+
+  const orders = await ctx.cache.dedupViewMarket(stationId, () => ctx.api.viewMarket());
+  if (orders.length > 0) {
+    cacheMarketData(ctx, stationId, orders);
+  }
+  return orders;
+}
+
+/**
+ * Fleet-deduped getSystem. If another bot fetched this system within 2min,
+ * returns cached data. Coalesces in-flight requests. Updates galaxy graph.
+ */
+export async function fleetGetSystem(ctx: BotContext): Promise<import("../types/game").StarSystem> {
+  const systemId = ctx.player.currentSystem;
+  const result = await ctx.cache.dedupGetSystem(systemId, () => ctx.api.getSystem());
+  if (result) {
+    ctx.galaxy.updateSystem(result);
+    ctx.cache.setSystemDetail(result.id, result);
+    return result;
+  }
+  // Dedup returned cached — read from galaxy graph
+  const cached = ctx.galaxy.getSystem(systemId);
+  if (cached) return cached;
+  // Fallback: force fetch (shouldn't happen, but safety net)
+  const fresh = await ctx.api.getSystem();
+  if (fresh?.id) {
+    ctx.galaxy.updateSystem(fresh);
+    ctx.cache.setSystemDetail(fresh.id, fresh);
+  }
+  return fresh;
+}
+
+/**
+ * Fleet-deduped analyzeMarket. Skips if insights are fresh (30min).
+ * Coalesces in-flight requests. Mutation (costs 1 tick).
+ */
+export async function fleetAnalyzeMarket(ctx: BotContext, stationId: string): Promise<void> {
+  await ctx.cache.dedupAnalyzeMarket(stationId, () => ctx.api.analyzeMarket(stationId));
+}
+
+/**
+ * Fleet-deduped viewFactionStorage. Faction storage is shared across all bots —
+ * if fetched within 30s, returns cached data. Coalesces in-flight requests.
+ */
+export async function fleetViewFactionStorage(
+  ctx: BotContext,
+): Promise<{ credits: number; items: import("../types/game").CargoItem[]; itemNames: Map<string, string> }> {
+  return ctx.cache.dedupFactionStorage(() => ctx.api.viewFactionStorageFull());
+}
+
+/**
+ * Fleet-deduped shipyardShowroom. Returns cached data if within 30min fresh window.
+ * Coalesces in-flight requests. Auto-caches to shipyard cache.
+ */
+export async function fleetShipyardShowroom(
+  ctx: BotContext, stationId: string,
+): Promise<Array<{ id: string; name: string; classId: string; price: number }>> {
+  return ctx.cache.dedupShipyard(stationId, async () => {
+    const showroom = await ctx.api.shipyardShowroom();
+    return showroom.map((s) => ({
+      id: String(s.id ?? s.ship_id ?? ""),
+      name: String(s.name ?? s.ship_name ?? "Unknown"),
+      classId: String(s.class_id ?? s.ship_class ?? s.classId ?? ""),
+      price: Number(s.price ?? s.cost ?? 0),
+    }));
+  });
+}
+
+/**
+ * Fleet-deduped getPoi. POI resource data is global — same for all bots.
+ * Returns detail if freshly fetched, or null if within 5min dedup window (use galaxy cache).
+ * Auto-updates galaxy POI resources.
+ */
+export async function fleetGetPoi(
+  ctx: BotContext, poiId: string,
+): Promise<import("../types/game").PoiDetail | null> {
+  const detail = await ctx.cache.dedupPoi(poiId, () => ctx.api.getPoi());
+  if (detail && detail.resources.length > 0) {
+    ctx.galaxy.updatePoiResources(poiId, detail.resources);
+  }
+  return detail;
 }
 
 /**
@@ -1353,7 +1472,8 @@ export async function* equipModulesForRoutine(
       // Withdraw from faction storage — prefer highest tier
       try {
         if (!factionStorage) {
-          factionStorage = await ctx.api.viewFactionStorage() ?? [];
+          const factionData = await fleetViewFactionStorage(ctx);
+          factionStorage = factionData.items.filter(i => i.quantity > 0);
         }
         const storageMatches = factionStorage
           .filter((s) => s.itemId.includes(modPattern) && s.quantity > 0 && canFitModule(ctx, s.itemId).fits)
@@ -1373,6 +1493,7 @@ export async function* equipModulesForRoutine(
             // Deposit it back
             try {
               await ctx.api.factionDepositItems(mod.itemId, 1);
+              ctx.cache.invalidateFactionStorage();
               await ctx.refreshState();
               mod.quantity++;
             } catch { /* best effort */ }
@@ -1399,7 +1520,7 @@ export async function* equipModulesForRoutine(
                 continue;
               } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                try { await ctx.api.factionDepositItems(remote.itemId, 1); await ctx.refreshState(); } catch { /* best effort */ }
+                try { await ctx.api.factionDepositItems(remote.itemId, 1); ctx.cache.invalidateFactionStorage(); await ctx.refreshState(); } catch { /* best effort */ }
                 if (msg.includes("cpu") || msg.includes("power") || msg.includes("slot")) {
                   yield `ship slots full — ${msg}`;
                   return;

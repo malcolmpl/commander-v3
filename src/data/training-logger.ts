@@ -174,10 +174,10 @@ export class TrainingLogger {
     });
   }
 
-  logFinancialEvent(type: "revenue" | "cost", amount: number, botId?: string): void {
+  logFinancialEvent(type: "revenue" | "cost", amount: number, botId?: string, source?: string): void {
     if (amount <= 0) return;
     this.db.insert(financialEvents).values({
-      timestamp: Date.now(), eventType: type, amount, botId: botId ?? null,
+      timestamp: Date.now(), eventType: type, amount, botId: botId ?? null, source: source ?? null,
     }).run();
   }
 
@@ -209,7 +209,7 @@ export class TrainingLogger {
   }
 
   logTrade(params: {
-    botId: string; action: "buy" | "sell"; itemId: string;
+    botId: string; action: "buy" | "sell" | "craft"; itemId: string;
     quantity: number; priceEach: number; total: number; stationId?: string;
   }): void {
     this.db.insert(tradeLog).values({

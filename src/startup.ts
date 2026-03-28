@@ -35,13 +35,14 @@ import { gt, lt } from "drizzle-orm";
 import { handleClientMessage, type MessageRouterDeps } from "./server/message-router";
 import { startBroadcastLoop, type BroadcastDeps } from "./server/broadcast";
 import {
-  loadBotSettings, loadFleetSettings, loadGoals,
-  saveBotSettings,
+  loadBotSettings, loadBotSkills, loadFleetSettings, loadGoals,
+  saveBotSettings, saveBotSkills,
   discoverFactionStorage, propagateFleetHome,
   ensureFactionMembership,
 } from "./fleet";
 import type { CommanderBrain } from "./commander/types";
 import { MemoryStore } from "./data/memory-store";
+import { EmbeddingStore } from "./commander/embedding-store";
 import { parseBotRole, type RolePoolConfig } from "./commander/roles";
 
 export interface AppServices {
@@ -65,6 +66,7 @@ export async function startup(config: AppConfig): Promise<AppServices> {
   const gameCache = new GameCache(db, trainingLogger);
   const shipyardCount = gameCache.loadShipyardData();
   if (shipyardCount > 0) console.log(`[Cache] Loaded ${shipyardCount} shipyard scans from disk`);
+  gameCache.loadRecentMarketData(sqlite);
   const sessionStore = new SessionStore(db);
   const eventBus = new EventBus();
 
@@ -200,6 +202,19 @@ export async function startup(config: AppConfig): Promise<AppServices> {
   // ── Persistent Memory Store (inspired by CHAPERON) ──
   const memoryStore = new MemoryStore(db);
 
+  // ── Embedding Store (semantic memory for strategic decisions) ──
+  const embeddingStore = new EmbeddingStore(db, {
+    ollamaUrl: config.ai.ollama_base_url,
+  });
+  // Check embedding model availability (non-blocking)
+  embeddingStore.checkHealth().then(available => {
+    if (available) {
+      console.log("[Startup] Embedding model (nomic-embed-text) available for semantic memory");
+    } else {
+      console.log("[Startup] Embedding model not available — memory store will use recency fallback. Run: ollama pull nomic-embed-text");
+    }
+  }).catch(() => {});
+
   // ── Commander Brain ──
   const brain = buildBrain(config, trainingLogger);
 
@@ -233,6 +248,11 @@ export async function startup(config: AppConfig): Promise<AppServices> {
     },
     recoverErrorBots: () => botManager.recoverStuckBots(),
     isBotManual: (botId: string) => botManager.getBot(botId)?.settings.manualControl ?? false,
+    embeddingStore,
+    ollamaConfig: {
+      baseUrl: config.ai.ollama_base_url,
+      model: config.ai.ollama_model,
+    },
   };
 
   const commander = new Commander(commanderConfig, commanderDeps, brain);
@@ -271,6 +291,13 @@ export async function startup(config: AppConfig): Promise<AppServices> {
       if (settings.role) bot.role = settings.role;
       if (settings.manualControl) manualBotIds.add(bot.id);
     }
+    // Seed cached skills from DB (available immediately without API call)
+    const cachedSkills = loadBotSkills(db, creds.username);
+    if (cachedSkills) bot.seedSkills(cachedSkills);
+    // Persist skills to DB whenever refreshed from API
+    bot.onSkillsRefreshed = (username, skills) => {
+      try { saveBotSkills(db, username, skills); } catch { /* non-critical */ }
+    };
   }
   if (savedBots.length > 0) {
     console.log(`[Fleet] Loaded ${savedBots.length} bots from session store`);
@@ -405,9 +432,28 @@ export async function startup(config: AppConfig): Promise<AppServices> {
     db,
     startTime: Date.now(),
     trainingLogger,
+    broadcastConfig: config.broadcast ? {
+      tickIntervalMs: config.broadcast.tick_interval_ms,
+      snapshotIntervalTicks: config.broadcast.snapshot_interval_ticks,
+      creditHistoryIntervalTicks: config.broadcast.credit_history_interval_ticks,
+      maxGlobalSnapshots: config.broadcast.max_global_snapshots,
+    } : undefined,
   };
 
   const stopBroadcast = startBroadcastLoop(broadcastDeps);
+
+  // ── Inject facility upgrade material needs (warehouse upgrade) ──
+  // These create high-priority work orders so miners/crafters target these materials
+  // Circuit board recipe: 3 copper_ore + 2 silicon_ore + 1 energy_crystal → 1 circuit_board
+  // Steel plate recipe: 5 iron_ore → 1 steel_plate
+  const warehouseNeeds = new Map<string, number>();
+  warehouseNeeds.set("steel_plate", 500);
+  warehouseNeeds.set("circuit_board", 200);
+  warehouseNeeds.set("silicon_ore", 400);       // 200 boards × 2 silicon each
+  warehouseNeeds.set("energy_crystal", 200);    // 200 boards × 1 crystal each
+  warehouseNeeds.set("iron_ore", 2500);         // 500 plates × 5 iron each
+  gameCache.setFacilityMaterialNeeds(warehouseNeeds);
+  console.log("[Startup] Facility material needs set: warehouse upgrade (steel plates, circuit boards, raw ores)");
 
   // ── Start Commander Eval Loop ──
   commander.start();

@@ -20,6 +20,7 @@ import {
   ensureMinCredits,
   depositExcessCredits,
   recoverStranded,
+  burnFuelCells,
   getParam,
 } from "./helpers";
 
@@ -42,6 +43,17 @@ export async function* returnHome(ctx: BotContext): AsyncGenerator<RoutineYield,
 
   // Navigate and dock
   yield "returning home";
+
+  // Proactive fuel cell burn: if low on fuel and undocked, burn cargo cells before navigating
+  if (!ctx.player.dockedAtBase && ctx.fuel.getPercentage(ctx.ship) < 30) {
+    const hasCells = ctx.ship.cargo.some(c => c.itemId.includes("fuel") && c.quantity > 0);
+    if (hasCells) {
+      yield "burning fuel cells before travel";
+      await burnFuelCells(ctx);
+      await ctx.refreshState();
+    }
+  }
+
   try {
     if (homeBase) {
       await navigateAndDock(ctx, homeBase);
@@ -50,7 +62,29 @@ export async function* returnHome(ctx: BotContext): AsyncGenerator<RoutineYield,
     const msg = err instanceof Error ? err.message : String(err);
     yield `return home failed: ${msg}`;
 
-    // If stranded (no fuel), attempt recovery via insurance/self-destruct
+    // If stranded (no fuel or insufficient), attempt fuel cell burn first
+    if (!ctx.player.dockedAtBase && ctx.ship.fuel < 10) {
+      const hasCells = ctx.ship.cargo.some(c => c.itemId.includes("fuel") && c.quantity > 0);
+      if (hasCells) {
+        yield "burning remaining fuel cells for recovery";
+        const burned = await burnFuelCells(ctx);
+        if (burned) {
+          await ctx.refreshState();
+          // Retry navigation after burning cells
+          try {
+            if (homeBase) {
+              await navigateAndDock(ctx, homeBase);
+              yield "home after fuel cell recovery";
+              // Fall through to servicing below
+            }
+          } catch {
+            yield `still cannot reach home after burning cells (fuel=${ctx.ship.fuel})`;
+          }
+        }
+      }
+    }
+
+    // If still stranded (no fuel), attempt recovery via insurance/self-destruct
     if (ctx.ship.fuel === 0 && !ctx.player.dockedAtBase) {
       yield "stranded — attempting recovery";
       const recovery = await recoverStranded(ctx);

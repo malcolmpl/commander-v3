@@ -25,18 +25,237 @@ export class GameCache {
   private shipyardCache = new Map<string, { ships: Array<{ id: string; name: string; classId: string; price: number }>; fetchedAt: number }>();
   marketDirty = false;
 
+  // ── Fleet-wide query dedup ──
+  // In-flight promise dedup: if bot A is already fetching viewMarket for station X,
+  // bot B will await the same promise instead of firing a second API call.
+  private inflightMarket = new Map<string, Promise<import("../types/game").MarketOrder[]>>();
+  private inflightSystem = new Map<string, Promise<StarSystem>>();
+  private inflightInsights = new Map<string, Promise<import("../core/api-client").AnalyzeMarketResult | null>>();
+
+  /** Dedup TTLs — skip API call entirely if data was fetched within this window */
+  private static readonly MARKET_DEDUP_MS = 60_000;   // 60s — market orders change slowly
+  private static readonly SYSTEM_DEDUP_MS = 120_000;   // 2min — system topology is near-static
+  private static readonly INSIGHT_DEDUP_MS = 1_800_000; // 30min — insights update infrequently
+
+  /**
+   * Fleet-wide deduped viewMarket. If another bot fetched this station's market
+   * within MARKET_DEDUP_MS, returns cached data. If a fetch is in-flight, awaits it.
+   * Otherwise fires a fresh API call and shares the result.
+   */
+  async dedupViewMarket(
+    stationId: string,
+    fetcher: () => Promise<import("../types/game").MarketOrder[]>,
+  ): Promise<import("../types/game").MarketOrder[]> {
+    // Check freshness — skip API entirely if recently fetched
+    const fetchedAt = this.marketFetchedAt.get(stationId) ?? 0;
+    if (fetchedAt > 0 && (Date.now() - fetchedAt) < GameCache.MARKET_DEDUP_MS) {
+      const cached = this.getMarketPrices(stationId);
+      if (cached) return []; // Signal: data is fresh in cache, caller should use cache
+    }
+
+    // Coalesce in-flight requests
+    const inflight = this.inflightMarket.get(stationId);
+    if (inflight) return inflight;
+
+    const promise = fetcher().finally(() => this.inflightMarket.delete(stationId));
+    this.inflightMarket.set(stationId, promise);
+    return promise;
+  }
+
+  /**
+   * Fleet-wide deduped getSystem. Returns cached StarSystem if recently fetched,
+   * coalesces in-flight requests, or fires a fresh API call.
+   */
+  async dedupGetSystem(
+    systemId: string,
+    fetcher: () => Promise<StarSystem>,
+  ): Promise<StarSystem | null> {
+    // Check timed cache freshness
+    const cached = this.getTimed(`system:${systemId}`);
+    if (cached) {
+      // System is in timed cache (still within TTL) — check dedup window
+      const row = this.db.select({ fetchedAt: timedCache.fetchedAt }).from(timedCache)
+        .where(eq(timedCache.key, `system:${systemId}`)).get();
+      if (row && (Date.now() - row.fetchedAt) < GameCache.SYSTEM_DEDUP_MS) {
+        return JSON.parse(cached); // Fresh enough — skip API
+      }
+    }
+
+    // Coalesce in-flight requests
+    const inflight = this.inflightSystem.get(systemId);
+    if (inflight) return inflight;
+
+    const promise = fetcher().finally(() => this.inflightSystem.delete(systemId));
+    this.inflightSystem.set(systemId, promise);
+    return promise;
+  }
+
+  /**
+   * Fleet-wide deduped analyzeMarket. Skips if fresh insights exist,
+   * coalesces in-flight requests.
+   */
+  async dedupAnalyzeMarket(
+    stationId: string,
+    fetcher: () => Promise<import("../core/api-client").AnalyzeMarketResult>,
+  ): Promise<import("../core/api-client").AnalyzeMarketResult | null> {
+    // Already fresh?
+    if (this.hasFreshInsights(stationId, GameCache.INSIGHT_DEDUP_MS)) return null;
+
+    // Coalesce in-flight
+    const inflight = this.inflightInsights.get(stationId);
+    if (inflight) return inflight;
+
+    const promise = fetcher()
+      .then((result) => {
+        if (result.insights.length > 0) {
+          this.setMarketInsights(stationId, result.insights);
+        }
+        return result;
+      })
+      .catch(() => null)
+      .finally(() => this.inflightInsights.delete(stationId));
+    this.inflightInsights.set(stationId, promise);
+    return promise;
+  }
+
+  // ── Faction Storage dedup ──
+  private inflightFactionStorage: Promise<{ credits: number; items: import("../types/game").CargoItem[]; itemNames: Map<string, string> }> | null = null;
+  private factionStorageFetchedAt = 0;
+  private factionStorageCache: { credits: number; items: import("../types/game").CargoItem[]; itemNames: Map<string, string> } | null = null;
+  private static readonly FACTION_STORAGE_DEDUP_MS = 30_000; // 30s — shared, changes infrequently
+
+  /**
+   * Fleet-wide deduped viewFactionStorageFull. Faction storage is shared across all bots.
+   * Returns cached data if fetched within 30s, coalesces in-flight requests.
+   */
+  async dedupFactionStorage(
+    fetcher: () => Promise<{ credits: number; items: import("../types/game").CargoItem[]; itemNames: Map<string, string> }>,
+  ): Promise<{ credits: number; items: import("../types/game").CargoItem[]; itemNames: Map<string, string> }> {
+    if (this.factionStorageCache && (Date.now() - this.factionStorageFetchedAt) < GameCache.FACTION_STORAGE_DEDUP_MS) {
+      return this.factionStorageCache;
+    }
+    if (this.inflightFactionStorage) return this.inflightFactionStorage;
+
+    const promise = fetcher()
+      .then((result) => {
+        this.factionStorageCache = result;
+        this.factionStorageFetchedAt = Date.now();
+        return result;
+      })
+      .finally(() => { this.inflightFactionStorage = null; });
+    this.inflightFactionStorage = promise;
+    return promise;
+  }
+
+  /** Invalidate faction storage cache (call after deposits/withdrawals) */
+  invalidateFactionStorage(): void {
+    this.factionStorageFetchedAt = 0;
+    this.factionStorageCache = null;
+  }
+
+  // ── Shipyard Showroom dedup ──
+  private inflightShipyard = new Map<string, Promise<Array<{ id: string; name: string; classId: string; price: number }>>>();
+
+  /**
+   * Fleet-wide deduped shipyardShowroom. Shipyard inventory is station-level.
+   * Returns cached data if within 30min fresh window, coalesces in-flight requests.
+   */
+  async dedupShipyard(
+    stationId: string,
+    fetcher: () => Promise<Array<{ id: string; name: string; classId: string; price: number }>>,
+  ): Promise<Array<{ id: string; name: string; classId: string; price: number }>> {
+    // Check existing cache freshness
+    const existing = this.shipyardCache.get(stationId);
+    if (existing && (Date.now() - existing.fetchedAt) < GameCache.SHIPYARD_FRESH) {
+      return existing.ships;
+    }
+
+    const inflight = this.inflightShipyard.get(stationId);
+    if (inflight) return inflight;
+
+    const promise = fetcher()
+      .then((ships) => {
+        this.setShipyardData(stationId, ships);
+        return ships;
+      })
+      .finally(() => this.inflightShipyard.delete(stationId));
+    this.inflightShipyard.set(stationId, promise);
+    return promise;
+  }
+
+  // ── POI Detail dedup ──
+  private inflightPoi = new Map<string, Promise<import("../types/game").PoiDetail>>();
+  private poiFetchedAt = new Map<string, number>();
+  private static readonly POI_DEDUP_MS = 300_000; // 5min — POI resources are near-static
+
+  /**
+   * Fleet-wide deduped getPoi. POI resource data is global (same for all bots).
+   * Returns cached data if fetched within 5min, coalesces in-flight requests.
+   */
+  async dedupPoi(
+    poiId: string,
+    fetcher: () => Promise<import("../types/game").PoiDetail>,
+  ): Promise<import("../types/game").PoiDetail | null> {
+    const fetchedAt = this.poiFetchedAt.get(poiId) ?? 0;
+    if (fetchedAt > 0 && (Date.now() - fetchedAt) < GameCache.POI_DEDUP_MS) {
+      return null; // Signal: data is fresh, use galaxy cache
+    }
+
+    const inflight = this.inflightPoi.get(poiId);
+    if (inflight) return inflight;
+
+    const promise = fetcher()
+      .then((detail) => {
+        this.poiFetchedAt.set(poiId, Date.now());
+        return detail;
+      })
+      .finally(() => this.inflightPoi.delete(poiId));
+    this.inflightPoi.set(poiId, promise);
+    return promise;
+  }
+
   /** Active arbitrage route claims — prevents multiple traders racing the same route */
   private arbitrageClaims = new Map<string, { botId: string; claimedAt: number }>();
+  private static readonly ARBITRAGE_CLAIM_TTL = 1_200_000; // 20 min (was 10 min — multi-jump routes need more time)
 
   /** Material requirements for queued facility builds (itemId → quantity needed) */
   private _facilityMaterialNeeds = new Map<string, number>();
+
+  /** Global recipe no-demand tracker — shared across all crafters to avoid repeating failed recipes */
+  private noDemandRecipes = new Map<string, { failedAt: number; failCount: number }>();
+  private static readonly NO_DEMAND_TTL = 180_000; // 3 min before retrying a failed recipe
+
+  /** Mark a recipe as having no demand (called by crafter after sell failure) */
+  markRecipeNoDemand(recipeId: string): void {
+    const existing = this.noDemandRecipes.get(recipeId);
+    this.noDemandRecipes.set(recipeId, {
+      failedAt: Date.now(),
+      failCount: (existing?.failCount ?? 0) + 1,
+    });
+  }
+
+  /** Check if a recipe has been globally flagged as no-demand */
+  isRecipeNoDemand(recipeId: string): boolean {
+    const entry = this.noDemandRecipes.get(recipeId);
+    if (!entry) return false;
+    if (Date.now() - entry.failedAt > GameCache.NO_DEMAND_TTL) {
+      this.noDemandRecipes.delete(recipeId);
+      return false;
+    }
+    return entry.failCount >= 2; // Require 2 failures (from any crafter) before global skip
+  }
+
+  /** Clear no-demand flag for a recipe (called when a sale succeeds) */
+  clearRecipeNoDemand(recipeId: string): void {
+    this.noDemandRecipes.delete(recipeId);
+  }
 
   /** Claim an arbitrage route (item@buyStation→sellStation). Returns false if already claimed. */
   claimArbitrageRoute(itemId: string, buyStationId: string, sellStationId: string, botId: string): boolean {
     const key = `${itemId}:${buyStationId}:${sellStationId}`;
     const existing = this.arbitrageClaims.get(key);
-    // Allow re-claim by same bot, or if claim is stale (>10 min)
-    if (existing && existing.botId !== botId && (Date.now() - existing.claimedAt) < 600_000) {
+    // Allow re-claim by same bot, or if claim is stale
+    if (existing && existing.botId !== botId && (Date.now() - existing.claimedAt) < GameCache.ARBITRAGE_CLAIM_TTL) {
       return false; // Already claimed by another bot
     }
     this.arbitrageClaims.set(key, { botId, claimedAt: Date.now() });
@@ -54,7 +273,7 @@ export class GameCache {
     const existing = this.arbitrageClaims.get(key);
     if (!existing) return false;
     if (existing.botId === botId) return false; // Own claim
-    return (Date.now() - existing.claimedAt) < 600_000; // Stale after 10 min
+    return (Date.now() - existing.claimedAt) < GameCache.ARBITRAGE_CLAIM_TTL;
   }
 
   constructor(
@@ -656,9 +875,21 @@ export class GameCache {
     }).run();
   }
 
-  /** Persist multiple POIs from a system scan */
+  /** Persist multiple POIs from a system scan (preserves existing resource data) */
   persistSystemPois(systemId: string, pois: PoiSummary[]): void {
     for (const poi of pois) {
+      // Don't overwrite existing POIs that have resource data with empty-resource versions
+      // (get_system returns POIs with resources: [], get_poi fills in the real data)
+      if (poi.resources.length === 0) {
+        const existing = this.db.select({ data: poiCache.data }).from(poiCache)
+          .where(eq(poiCache.poiId, poi.id)).get();
+        if (existing) {
+          try {
+            const prev = JSON.parse(existing.data) as PoiSummary;
+            if (prev.resources?.length > 0) continue; // Keep existing resource data
+          } catch { /* corrupt — overwrite */ }
+        }
+      }
       this.persistPoi(poi.id, systemId, poi);
     }
   }
@@ -683,6 +914,29 @@ export class GameCache {
       try { results.push(JSON.parse(row.data)); } catch { /* skip */ }
     }
     return results;
+  }
+
+  /** Find all belts containing a specific resource (searches persisted POI data) */
+  findBeltsWithResource(resourceId: string): Array<{ poiId: string; systemId: string; name: string; richness: number; remaining: number }> {
+    const rows = this.db.select().from(poiCache).all();
+    const results: Array<{ poiId: string; systemId: string; name: string; richness: number; remaining: number }> = [];
+    for (const row of rows) {
+      try {
+        const poi = JSON.parse(row.data) as PoiSummary;
+        if (!poi.resources?.length) continue;
+        const res = poi.resources.find(r => r.resourceId === resourceId);
+        if (res) {
+          results.push({
+            poiId: row.poiId,
+            systemId: row.systemId,
+            name: poi.name,
+            richness: res.richness,
+            remaining: res.remaining,
+          });
+        }
+      } catch { /* skip corrupt */ }
+    }
+    return results.sort((a, b) => b.richness - a.richness);
   }
 
   /** Count persisted POIs */

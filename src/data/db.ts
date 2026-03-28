@@ -125,6 +125,8 @@ function ensureTables(sqlite: Database): void {
     )`);
     sqlite.run("CREATE INDEX IF NOT EXISTS idx_market_station_item ON market_history(station_id, item_id)");
     sqlite.run("CREATE INDEX IF NOT EXISTS idx_market_tick ON market_history(tick)");
+    // Migration: add created_at to older databases
+    try { sqlite.run("ALTER TABLE market_history ADD COLUMN created_at TEXT DEFAULT (datetime('now'))"); } catch { /* already exists */ }
 
     // Commander log
     sqlite.run(`CREATE TABLE IF NOT EXISTS commander_log (
@@ -198,6 +200,8 @@ function ensureTables(sqlite: Database): void {
     )`);
     sqlite.run("CREATE INDEX IF NOT EXISTS idx_financial_ts ON financial_events(timestamp)");
     sqlite.run("CREATE INDEX IF NOT EXISTS idx_financial_type ON financial_events(event_type)");
+    // Migration: add source column to existing financial_events tables
+    try { sqlite.run(`ALTER TABLE financial_events ADD COLUMN source TEXT`); } catch { /* already exists */ }
 
     // Trade log
     sqlite.run(`CREATE TABLE IF NOT EXISTS trade_log (
@@ -282,6 +286,27 @@ function ensureTables(sqlite: Database): void {
       importance INTEGER NOT NULL DEFAULT 5,
       updated_at TEXT DEFAULT (datetime('now'))
     )`);
+
+    // Bot skills (persisted skill snapshots)
+    sqlite.run(`CREATE TABLE IF NOT EXISTS bot_skills (
+      username TEXT PRIMARY KEY,
+      skills TEXT NOT NULL,
+      updated_at TEXT DEFAULT (datetime('now'))
+    )`);
+
+    // Outcome embeddings (semantic memory for strategic decisions)
+    sqlite.run(`CREATE TABLE IF NOT EXISTS outcome_embeddings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      text TEXT NOT NULL,
+      embedding TEXT NOT NULL,
+      category TEXT NOT NULL,
+      metadata TEXT NOT NULL DEFAULT '{}',
+      profit_impact REAL,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`);
+    sqlite.run("CREATE INDEX IF NOT EXISTS idx_embed_category ON outcome_embeddings(category)");
+    sqlite.run("CREATE INDEX IF NOT EXISTS idx_embed_created ON outcome_embeddings(created_at)");
+    sqlite.run("CREATE INDEX IF NOT EXISTS idx_embed_profit ON outcome_embeddings(profit_impact)");
   });
 
   tx();

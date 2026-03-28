@@ -24,6 +24,9 @@ import { ChatIntelligence } from "./chat-intelligence";
 import type { MemoryStore } from "../data/memory-store";
 import type { StuckBot } from "../types/protocol";
 import { type BotRole, type RolePoolConfig, DEFAULT_POOL_CONFIG, parseBotRole, routineToRole } from "./roles";
+import { EmbeddingStore, type OutcomeCategory } from "./embedding-store";
+import { StrategicTriggerEngine, type StrategicTrigger } from "./strategic-triggers";
+import { buildStrategicSystemPrompt, buildStrategicUserPrompt, parseLlmResponse } from "./prompt-builder";
 
 export interface CommanderConfig {
   /** Evaluation interval in seconds */
@@ -64,6 +67,10 @@ export interface CommanderDeps {
   recoverErrorBots?: () => Promise<void>;
   /** Check if a bot is under manual control (excluded from commander eval) */
   isBotManual?: (botId: string) => boolean;
+  /** Embedding-based memory store for strategic decisions (optional) */
+  embeddingStore?: EmbeddingStore;
+  /** Ollama config for strategic LLM consultations (used when brain="scoring") */
+  ollamaConfig?: { baseUrl: string; model: string };
 }
 
 export class Commander {
@@ -93,6 +100,10 @@ export class Commander {
   private _evaluating = false;
   /** Role pool sizing config */
   private _poolConfig: RolePoolConfig[] = DEFAULT_POOL_CONFIG;
+  /** Strategic trigger engine — decides when to call LLM */
+  private triggerEngine = new StrategicTriggerEngine();
+  /** Last strategic trigger (for dashboard) */
+  private lastTrigger: StrategicTrigger | null = null;
 
   constructor(
     private config: CommanderConfig,
@@ -258,6 +269,34 @@ export class Commander {
     return h ? [h] : [];
   }
 
+  /** Get AI settings for dashboard */
+  getAiSettings(): { ollamaModel: string; ollamaBaseUrl: string } | null {
+    if ("getTierByPrefix" in this.brain) {
+      const ollama = (this.brain as any).getTierByPrefix("ollama");
+      if (ollama && "getModel" in ollama) {
+        return { ollamaModel: ollama.getModel(), ollamaBaseUrl: ollama.getBaseUrl() };
+      }
+    }
+    if ("getModel" in this.brain) {
+      return { ollamaModel: (this.brain as any).getModel(), ollamaBaseUrl: (this.brain as any).getBaseUrl() };
+    }
+    return null;
+  }
+
+  /** Update AI settings at runtime */
+  updateAiSettings(settings: { ollamaModel?: string; ollamaBaseUrl?: string; timeoutMs?: number }): void {
+    let ollama: any = null;
+    if ("getTierByPrefix" in this.brain) {
+      ollama = (this.brain as any).getTierByPrefix("ollama");
+    } else if ("setModel" in this.brain) {
+      ollama = this.brain;
+    }
+    if (!ollama) return;
+    if (settings.ollamaModel) ollama.setModel(settings.ollamaModel);
+    if (settings.ollamaBaseUrl) ollama.setBaseUrl(settings.ollamaBaseUrl);
+    if (settings.timeoutMs) ollama.setTimeoutMs(settings.timeoutMs);
+  }
+
   /** Get recent decision history */
   getDecisionHistory(): CommanderDecision[] {
     return [...this.decisionHistory];
@@ -394,6 +433,31 @@ export class Commander {
       }
     }
 
+    // Step 0.7b: Hydrate POI data (runs every first eval — POI index may be empty even with 500+ systems)
+    if (this.deps.cache && this.deps.galaxy.poiCount === 0) {
+      // Hydrate with persisted system details (full POI data from previous sessions)
+      try {
+        const persistedSystems = this.deps.cache.loadPersistedSystemDetails();
+        if (persistedSystems.length > 0) {
+          let poiBefore = this.deps.galaxy.poiCount;
+          for (const sys of persistedSystems) {
+            if (sys.id && sys.pois.length > 0) this.deps.galaxy.updateSystem(sys);
+          }
+          const gained = this.deps.galaxy.poiCount - poiBefore;
+          if (gained > 0) console.log(`[Commander] Hydrated ${gained} POIs from ${persistedSystems.length} persisted system details`);
+        }
+      } catch { /* non-critical */ }
+
+      // Hydrate persisted POI discoveries
+      try {
+        const persistedPois = this.deps.cache.loadPersistedPois();
+        if (persistedPois.length > 0) {
+          const enriched = this.deps.galaxy.hydrateFromPersistedPois(persistedPois);
+          if (enriched > 0) console.log(`[Commander] Hydrated ${enriched} POIs from ${persistedPois.length} persisted discoveries`);
+        }
+      } catch { /* non-critical */ }
+    }
+
     // Step 0.8: Ensure recipe + item catalogs are loaded (cold-start: crafters need recipes)
     if (this.deps.crafting.recipeCount === 0) {
       const api = this.deps.getApi?.();
@@ -470,31 +534,70 @@ export class Commander {
     // Step 3.8: Pre-evaluation emergency overrides — clear cooldowns BEFORE brain runs
     this.applyEmergencyOverrides(fleet);
 
-    // Step 4: Run brain evaluation (inject performance + memory + chat context)
+    // Step 4: Run scoring brain (ALWAYS — fast, deterministic, <50ms)
     const performanceContext = this.performanceTracker.buildContextBlock();
     const memoryContext = this.deps.memoryStore?.buildContextBlock() ?? "";
     const chatContext = this._chatIntelligence?.buildContextBlock() ?? "";
     const extraContext = [performanceContext, memoryContext, chatContext].filter(Boolean).join("\n\n");
 
-    const output = await this.brain.evaluate({
+    const evalInput = {
       fleet,
       goals: this.goals,
       economy: economySnapshot,
       world,
       tick: this.tick,
       extraContext: extraContext || undefined,
-    });
+    };
+
+    // Scoring brain is always the primary decision maker
+    const scoringBrain = this.getScoringBrain();
+    let output: EvaluationOutput;
+
+    if (scoringBrain) {
+      output = await scoringBrain.evaluate(evalInput);
+    } else {
+      // Fallback: use whatever brain is configured (shouldn't happen normally)
+      output = await this.brain.evaluate(evalInput);
+    }
+
+    // Step 4.5: Check strategic triggers — should we consult the LLM?
+    const trigger = this.triggerEngine.evaluate(fleet, economySnapshot, world, this.goals);
+    if (trigger) {
+      this.lastTrigger = trigger;
+      console.log(`[Commander] Strategic trigger: ${trigger.type} — ${trigger.reason}`);
+
+      // Merge strategic advice from LLM (non-blocking on failure)
+      try {
+        const strategicOutput = await this.consultLlm(trigger, fleet, economySnapshot);
+        if (strategicOutput && strategicOutput.assignments.length > 0) {
+          // LLM overrides only the bots it specifically mentions
+          const overrideMap = new Map(strategicOutput.assignments.map(a => [a.botId, a]));
+          for (const [botId, override] of overrideMap) {
+            const idx = output.assignments.findIndex(a => a.botId === botId);
+            if (idx >= 0) {
+              output.assignments[idx] = override;
+            } else {
+              output.assignments.push(override);
+            }
+          }
+          output.reasoning += ` | Strategic: ${strategicOutput.reasoning}`;
+          console.log(`[Commander] LLM overrode ${overrideMap.size} assignment(s): ${strategicOutput.reasoning}`);
+        }
+      } catch (err) {
+        // LLM failure is non-critical — scoring brain result stands
+        console.log(`[Commander] Strategic LLM consultation failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
 
     // Step 5: Build conversational thoughts
     const thoughts = this.buildThoughts(fleet, world, output);
 
-    // Step 5a: Enforce routine caps (prevents LLM brains from over-assigning)
+    // Step 5a: Enforce routine caps (prevents LLM overrides from violating constraints)
     const ROUTINE_CAPS: Partial<Record<string, number>> = {
       scout: 1, explorer: fleet.bots.length >= 6 ? 2 : 1,
       quartermaster: 1, hunter: 1, salvager: 1, scavenger: 1,
       ship_upgrade: 1, refit: 2, ship_dealer: 1,
     };
-    // Count bots already running each routine (that won't be reassigned)
     const routineCounts = new Map<string, number>();
     const assignedBotIds = new Set(output.assignments.map(a => a.botId));
     for (const bot of fleet.bots) {
@@ -502,12 +605,11 @@ export class Commander {
         routineCounts.set(bot.routine, (routineCounts.get(bot.routine) ?? 0) + 1);
       }
     }
-    // Filter assignments that would exceed caps
     const cappedAssignments = output.assignments.filter(a => {
       const cap = ROUTINE_CAPS[a.routine];
-      if (cap === undefined) return true; // No cap
+      if (cap === undefined) return true;
       const current = routineCounts.get(a.routine) ?? 0;
-      if (current >= cap) return false; // Cap exceeded, skip
+      if (current >= cap) return false;
       routineCounts.set(a.routine, current + 1);
       return true;
     });
@@ -573,6 +675,11 @@ export class Commander {
 
     // Step 7: Log and record
     this.recordDecision(decision, fleet, economySnapshot);
+
+    // Step 7.5: Log outcomes to embedding store (for memory-augmented future decisions)
+    if (this.deps.embeddingStore && executedAssignments.length > 0) {
+      this.logOutcomesToEmbeddings(executedAssignments, fleet, economySnapshot);
+    }
 
     // Step 8: Record strategic memories (persistent knowledge)
     this.recordMemories(fleet, world, decision);
@@ -1113,6 +1220,196 @@ export class Commander {
       }
     } catch {
       // Memory store failure shouldn't break the Commander
+    }
+  }
+
+  /** Get the last strategic trigger (for dashboard) */
+  getLastTrigger(): StrategicTrigger | null {
+    return this.lastTrigger;
+  }
+
+  /** Get strategic trigger engine state (for dashboard) */
+  getTriggerState(): { lastLlmCallAgo: number; creditTrend: number; periodicIntervalMs: number } {
+    return this.triggerEngine.getState();
+  }
+
+  /**
+   * Consult the LLM brain for strategic advice.
+   * Uses the focused strategic prompt (not the full fleet dump).
+   * Retrieves relevant memories from embedding store for context.
+   */
+  private async consultLlm(
+    trigger: StrategicTrigger,
+    fleet: FleetStatus,
+    economy: import("./types").EconomySnapshot,
+  ): Promise<EvaluationOutput | null> {
+    // Find the LLM brain (first non-scoring tier in tiered brain)
+    let llmBrain: CommanderBrain | null = null;
+    if ("tiers" in this.brain) {
+      const tiers = (this.brain as any).tiers as CommanderBrain[];
+      for (const tier of tiers) {
+        if (!(tier instanceof ScoringBrain)) {
+          const health = tier.getHealth?.();
+          if (health?.available !== false) {
+            llmBrain = tier;
+            break;
+          }
+        }
+      }
+    } else if (!(this.brain instanceof ScoringBrain)) {
+      llmBrain = this.brain;
+    }
+
+    // Resolve Ollama connection: from LLM brain instance, deps config, or defaults
+    let baseUrl: string;
+    let model: string;
+
+    if (llmBrain) {
+      const brainAny = llmBrain as any;
+      baseUrl = brainAny.getBaseUrl?.() ?? brainAny.baseUrl ?? "http://localhost:11434";
+      model = brainAny.getModel?.() ?? brainAny.model ?? "qwen3:8b";
+    } else if (this.deps.ollamaConfig) {
+      baseUrl = this.deps.ollamaConfig.baseUrl;
+      model = this.deps.ollamaConfig.model;
+    } else {
+      console.log(`[Commander] Strategic: no LLM brain or Ollama config available`);
+      return null;
+    }
+
+    console.log(`[Commander] Strategic: consulting ${model} for ${trigger.type}...`);
+
+    // Retrieve relevant memories from embedding store
+    const embeddingStore = this.deps.embeddingStore;
+    let memories: import("./embedding-store").RetrievedMemory[] = [];
+    if (embeddingStore) {
+      const query = `${trigger.type}: ${trigger.reason}`;
+      memories = await embeddingStore.retrieve(query, { limit: 5 });
+    }
+
+    // Build the focused strategic prompt
+    const userPrompt = buildStrategicUserPrompt(
+      trigger, memories, fleet, economy, this.goals,
+    );
+
+    // Call Ollama directly with strategic prompt
+    const startTime = Date.now();
+    const validBotIds = new Set(fleet.bots.map(b => b.botId));
+    const systemPrompt = buildStrategicSystemPrompt();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          think: false,
+          stream: false,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          options: { num_predict: 512 },
+        }),
+        signal: AbortSignal.timeout(30_000),
+      });
+
+      if (!response.ok) {
+        console.log(`[Commander] Strategic LLM HTTP ${response.status}`);
+        return null;
+      }
+
+      const data = await response.json() as { message?: { content?: string } };
+      const responseText = data.message?.content ?? "";
+      if (!responseText) {
+        console.log(`[Commander] Strategic LLM returned empty response`);
+        return null;
+      }
+
+      const parsed = parseLlmResponse(responseText, validBotIds);
+      const latencyMs = Date.now() - startTime;
+
+      const assignments: Assignment[] = parsed.assignments.map(a => {
+        const bot = fleet.bots.find(b => b.botId === a.botId);
+        return {
+          botId: a.botId,
+          routine: a.routine,
+          params: {},
+          score: 100,
+          reasoning: `[Strategic/${trigger.type}] ${a.reasoning}`,
+          previousRoutine: bot?.routine ?? null,
+        };
+      });
+
+      this.triggerEngine.recordLlmCall();
+      console.log(`[Commander] Strategic LLM (${model}) responded in ${latencyMs}ms: ${assignments.length} override(s), confidence=${parsed.confidence}`);
+
+      return {
+        assignments,
+        reasoning: parsed.reasoning || `Strategic response to ${trigger.type}`,
+        brainName: `strategic/${llmBrain ? (llmBrain as any).name : model}`,
+        latencyMs,
+        confidence: parsed.confidence,
+      };
+    } catch (err) {
+      console.log(`[Commander] Strategic LLM call failed: ${err instanceof Error ? err.message : err}`);
+      return null;
+    }
+  }
+
+  /**
+   * Log routine outcomes to the embedding store for future retrieval.
+   * Non-blocking: fires and forgets.
+   */
+  private logOutcomesToEmbeddings(
+    assignments: FleetAssignment[],
+    fleet: FleetStatus,
+    economy: import("./types").EconomySnapshot,
+  ): void {
+    const store = this.deps.embeddingStore;
+    if (!store) return;
+
+    // Log each assignment as a potential outcome
+    for (const a of assignments) {
+      const bot = fleet.bots.find(b => b.botId === a.botId);
+      if (!bot) continue;
+
+      let category: OutcomeCategory = "strategic";
+      if (a.routine === "trader") category = "trade_outcome";
+      else if (a.routine === "miner" || a.routine === "harvester") category = "mine_outcome";
+      else if (a.routine === "crafter") category = "craft_outcome";
+
+      const text = `${bot.username} assigned ${a.routine} at ${bot.systemId} (ship=${bot.shipClass}, fuel=${bot.fuelPct}%, cargo=${bot.cargoPct}%)${a.previousRoutine ? ` from ${a.previousRoutine}` : ""}`;
+
+      store.store({
+        text,
+        category,
+        metadata: {
+          botId: a.botId,
+          routine: a.routine,
+          previousRoutine: a.previousRoutine,
+          system: bot.systemId,
+          shipClass: bot.shipClass,
+          credits: bot.credits,
+          score: a.score,
+        },
+        profitImpact: undefined, // Will be updated by performance tracker in future
+      }).catch(() => {}); // Fire and forget
+    }
+
+    // Log economy state as market intel (periodically, not every tick)
+    if (economy.deficits.length > 0 && Math.random() < 0.1) {
+      const deficitText = economy.deficits.slice(0, 3)
+        .map(d => `${d.itemId}: need ${d.demandPerHour}/hr, have ${d.supplyPerHour}/hr`)
+        .join("; ");
+
+      store.store({
+        text: `Supply deficits: ${deficitText} (net profit: ${economy.netProfit}cr/hr)`,
+        category: "market_intel",
+        metadata: {
+          deficits: economy.deficits.map(d => d.itemId),
+          netProfit: economy.netProfit,
+        },
+      }).catch(() => {}); // Fire and forget
     }
   }
 
