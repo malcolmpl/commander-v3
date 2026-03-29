@@ -1728,7 +1728,8 @@ export async function collectScatteredCargo(ctx: BotContext): Promise<number> {
     const storage = await ctx.api.viewStorage();
     if (!storage || storage.length === 0) return 0;
 
-    for (const item of storage) {
+    const items = Array.isArray(storage) ? storage : [];
+    for (const item of items) {
       if (ctx.shouldStop) break;
       if (isProtectedItem(item.itemId)) continue;
       if (item.quantity <= 0) continue;

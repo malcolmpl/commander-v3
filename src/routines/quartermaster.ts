@@ -1693,7 +1693,7 @@ async function* runCFOAnalysis(
         qty: ing.quantity,
         unitCost: ctx.crafting.getItemBasePrice(ing.itemId),
       })),
-      craftTimeTicks: Math.max(1, recipe.craftTime ?? 4),
+      craftTimeTicks: 4,
     });
 
     if (roi.netProfit > 0) {
@@ -1732,7 +1732,7 @@ async function* runCFOAnalysis(
   const PAYBACK_LIMIT_HOURS = 24;       // Only recommend if pays back within 24h
 
   for (const bot of fleet.bots) {
-    if (bot.routine !== "trader" && bot.routine !== "arbitrage_trader") continue;
+    if (bot.routine !== "trader") continue;
     if (bot.cargoCapacity >= CARGO_UPGRADE_THRESHOLD) continue;
 
     // Estimate current profit from recent ROI candidates
