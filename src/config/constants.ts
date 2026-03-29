@@ -16,7 +16,7 @@ export const FUEL_LOW_BURN_THRESHOLD = 50;       // % — burn cargo cells if be
 export const REPAIR_THRESHOLD = 80;              // % hull — repair when below
 export const REPAIR_SERVICE_THRESHOLD = 90;      // % hull — service-level repair
 export const MODULE_REPAIR_THRESHOLD = 90;       // % durability — repair worn modules
-export const EMERGENCY_HULL_THRESHOLD = 25;      // % hull — triggers emergency
+export const EMERGENCY_HULL_THRESHOLD = 60;      // % hull — triggers emergency
 
 // ── Insurance ──
 export const INSURANCE_MAX_WALLET_PCT = 0.10;    // max % of credits to spend on premium
