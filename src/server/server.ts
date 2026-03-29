@@ -9,8 +9,8 @@ import type { ServerMessage, ClientMessage } from "../types/protocol";
 import type { DB } from "../data/db";
 import type { TrainingLogger } from "../data/training-logger";
 import { gt, desc, sql, eq, and } from "drizzle-orm";
-import { creditHistory, marketHistory, activityLog, commanderLog as commanderLogTable, factionTransactions, financialEvents } from "../data/schema";
-import { verifyToken, extractToken, type TokenPayload } from "../auth/jwt";
+import { creditHistory, marketHistory, activityLog, commanderLog as commanderLogTable, factionTransactions, financialEvents, users } from "../data/schema";
+import { verifyToken, extractToken, createToken, hashPassword, verifyPassword, type TokenPayload } from "../auth/jwt";
 
 const RANGE_MS: Record<string, number> = {
   "1h": 60 * 60 * 1000,
@@ -87,7 +87,15 @@ export function createServer(opts: ServerOptions) {
           return Response.json({ status: "ok", clients: clients.size });
         }
 
-        // Authenticate REST API if required
+        // Auth endpoints are always public (login/register)
+        if (url.pathname === "/api/login" && req.method === "POST") {
+          return handleLogin(req, opts);
+        }
+        if (url.pathname === "/api/register" && req.method === "POST") {
+          return handleRegister(req, opts);
+        }
+
+        // Authenticate all other REST API routes if required
         if (opts.requireAuth) {
           const authHeader = req.headers.get("Authorization");
           const token = extractToken(authHeader) ?? url.searchParams.get("token");
@@ -456,4 +464,105 @@ async function handleMiningRateRoute(url: URL, db: DB): Promise<Response> {
     }));
 
   return Response.json(result);
+}
+
+// ── Auth Endpoints ──
+
+/** POST /api/register — create a new user account */
+async function handleRegister(req: Request, opts: ServerOptions): Promise<Response> {
+  try {
+    const body = await req.json();
+    const { username, email, password } = body;
+
+    if (!username || !email || !password) {
+      return Response.json({ error: "Username, email, and password are required" }, { status: 400 });
+    }
+    if (password.length < 8) {
+      return Response.json({ error: "Password must be at least 8 characters" }, { status: 400 });
+    }
+
+    const db = opts.db;
+    if (!db) return Response.json({ error: "Database not available" }, { status: 500 });
+
+    // Check if username or email exists
+    const [existing] = await db.select().from(users).where(eq(users.username, username)).limit(1);
+    if (existing) {
+      return Response.json({ error: "Username already taken" }, { status: 409 });
+    }
+
+    // Create user
+    const userId = crypto.randomUUID();
+    const passwordHash = await hashPassword(password);
+    await db.insert(users).values({
+      id: userId,
+      username,
+      email,
+      passwordHash,
+      role: "owner",
+      tier: "free",
+    });
+
+    // Create JWT token
+    const token = await createToken({
+      sub: userId,
+      username,
+      role: "owner",
+      tier: "free",
+      tenantId: opts.tenantId,
+    });
+
+    return Response.json({
+      message: "Account created",
+      token,
+      user: { id: userId, username, email, role: "owner", tier: "free" },
+    });
+  } catch (err: any) {
+    console.error("[Auth] Register error:", err.message);
+    return Response.json({ error: "Registration failed" }, { status: 500 });
+  }
+}
+
+/** POST /api/login — authenticate and return JWT */
+async function handleLogin(req: Request, opts: ServerOptions): Promise<Response> {
+  try {
+    const body = await req.json();
+    const { username, password } = body;
+
+    if (!username || !password) {
+      return Response.json({ error: "Username and password are required" }, { status: 400 });
+    }
+
+    const db = opts.db;
+    if (!db) return Response.json({ error: "Database not available" }, { status: 500 });
+
+    // Find user
+    const [user] = await db.select().from(users).where(eq(users.username, username)).limit(1);
+    if (!user) {
+      return Response.json({ error: "Invalid credentials" }, { status: 401 });
+    }
+
+    // Verify password
+    const valid = await verifyPassword(password, user.passwordHash);
+    if (!valid) {
+      return Response.json({ error: "Invalid credentials" }, { status: 401 });
+    }
+
+    // Create JWT token
+    const token = await createToken({
+      sub: user.id,
+      username: user.username,
+      role: user.role,
+      tier: user.tier,
+      tenantId: opts.tenantId,
+    });
+
+    return Response.json({
+      message: "Login successful",
+      token,
+      user: { id: user.id, username: user.username, email: user.email, role: user.role, tier: user.tier },
+    });
+  } catch (err: any) {
+    console.error("[Auth] Login error:", err.message);
+    return Response.json({ error: "Login failed" }, { status: 500 });
+  }
 }
