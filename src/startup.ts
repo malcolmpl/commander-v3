@@ -67,9 +67,86 @@ export interface AppServices {
 }
 
 /**
+ * Check LM Studio is running with the correct models loaded.
+ * Only runs when openai is in the tier_order or embed_provider is "openai".
+ */
+async function ensureLmStudioModels(config: AppConfig): Promise<void> {
+  const useOpenAI = config.ai.tier_order.includes("openai") || config.ai.embed_provider === "openai";
+  if (!useOpenAI) return;
+
+  const baseUrl = config.ai.openai_base_url;
+  const llmModel = config.ai.openai_model;
+  const embedModel = config.ai.embed_model;
+
+  // 1. Check what's loaded
+  let loaded: string[];
+  try {
+    const resp = await fetch(`${baseUrl}/v1/models`);
+    const data = await resp.json() as { data?: Array<{ id: string }> };
+    loaded = data.data?.map((m) => m.id) ?? [];
+  } catch {
+    console.error(`[Startup] Cannot connect to LM Studio at ${baseUrl}. Is it running?`);
+    process.exit(1);
+  }
+
+  // 2. Check for wrong models
+  if (loaded.length > 0) {
+    const hasLlm = loaded.some(id => id === llmModel || id.includes(llmModel));
+    const hasEmbed = loaded.some(id => id === embedModel || id.includes(embedModel));
+
+    if (!hasLlm && !hasEmbed) {
+      console.error(`[Startup] LM Studio has wrong models loaded: ${loaded.join(', ')}`);
+      console.error(`[Startup] Expected LLM: ${llmModel}, Embedding: ${embedModel}`);
+      console.error(`[Startup] Unload current models and restart, or update config.toml`);
+      process.exit(1);
+    }
+  }
+
+  // 3. Load missing models
+  if (!loaded.some(id => id === llmModel || id.includes(llmModel))) {
+    console.log(`[Startup] Loading LLM model: ${llmModel}...`);
+    try {
+      const resp = await fetch(`${baseUrl}/api/v1/models/load`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: llmModel }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+      console.log(`[Startup] LLM model loaded: ${llmModel}`);
+    } catch (e) {
+      console.error(`[Startup] Failed to load LLM model ${llmModel}: ${e}`);
+      process.exit(1);
+    }
+  } else {
+    console.log(`[Startup] LLM model already loaded: ${llmModel}`);
+  }
+
+  if (!loaded.some(id => id === embedModel || id.includes(embedModel))) {
+    console.log(`[Startup] Loading embedding model: ${embedModel}...`);
+    try {
+      const resp = await fetch(`${baseUrl}/api/v1/models/load`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: embedModel }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+      console.log(`[Startup] Embedding model loaded: ${embedModel}`);
+    } catch (e) {
+      console.error(`[Startup] Failed to load embedding model ${embedModel}: ${e}`);
+      process.exit(1);
+    }
+  } else {
+    console.log(`[Startup] Embedding model already loaded: ${embedModel}`);
+  }
+}
+
+/**
  * Wire all services together and start the application.
  */
 export async function startup(config: AppConfig): Promise<AppServices> {
+  // ── LM Studio model check (before anything else that uses AI) ──
+  await ensureLmStudioModels(config);
+
   // ── Tenant ID ──
   const tenantId = config._tenantId || config.database?.tenant_id || crypto.randomUUID();
   console.log(`[Startup] Tenant ID: ${tenantId}`);
@@ -263,15 +340,17 @@ export async function startup(config: AppConfig): Promise<AppServices> {
 
   // ── Embedding Store (semantic memory for strategic decisions) ──
   const embeddingStore = new EmbeddingStore(db, {
-    ollamaUrl: config.ai.ollama_base_url,
+    provider: config.ai.embed_provider,
+    baseUrl: config.ai.embed_provider === "openai" ? config.ai.openai_base_url : config.ai.ollama_base_url,
+    model: config.ai.embed_model,
     tenantId,
   });
   // Check embedding model availability (non-blocking)
   embeddingStore.checkHealth().then(available => {
     if (available) {
-      console.log("[Startup] Embedding model (nomic-embed-text) available for semantic memory");
+      console.log(`[Startup] Embedding model (${config.ai.embed_model}) available for semantic memory`);
     } else {
-      console.log("[Startup] Embedding model not available — memory store will use recency fallback. Run: ollama pull nomic-embed-text");
+      console.log(`[Startup] Embedding model not available — memory store will use recency fallback`);
     }
   }).catch(() => {});
 

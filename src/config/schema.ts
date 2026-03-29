@@ -59,6 +59,8 @@ export const AiConfigSchema = z.object({
   max_tokens: z.number().default(2048),
   shadow_mode: z.boolean().default(false),
   prompt_file: z.string().default(""),
+  embed_provider: z.enum(["ollama", "openai"]).default("openai"),
+  embed_model: z.string().default("text-embedding-nomic-embed-text-v1.5"),
 });
 
 export type AiConfig = z.infer<typeof AiConfigSchema>;

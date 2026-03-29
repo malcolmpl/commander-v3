@@ -1,7 +1,7 @@
 /**
  * Embedding-based memory store for strategic decisions.
- * Uses nomic-embed-text via Ollama for local embeddings,
- * stored in SQLite for fast cosine-similarity retrieval.
+ * Supports both Ollama and OpenAI-compatible embeddings (e.g. LM Studio),
+ * stored in DB for fast cosine-similarity retrieval.
  *
  * Replaces the dead RagStore with a working feedback loop:
  *   outcome → embed → store → retrieve similar → inject into LLM context
@@ -13,7 +13,6 @@ import { outcomeEmbeddings } from "../data/schema";
 
 const MAX_ENTRIES = 2000;
 const PRUNE_TO = 1500;
-const EMBED_DIM = 768; // nomic-embed-text dimension
 
 export type OutcomeCategory =
   | "trade_outcome"
@@ -41,7 +40,8 @@ export interface RetrievedMemory {
 }
 
 export class EmbeddingStore {
-  private ollamaUrl: string;
+  private provider: "ollama" | "openai";
+  private baseUrl: string;
   private model: string;
   private available = true;
   private lastHealthCheck = 0;
@@ -51,28 +51,46 @@ export class EmbeddingStore {
 
   constructor(
     private db: DB,
-    config?: { ollamaUrl?: string; model?: string; tenantId?: string },
+    config?: { provider?: "ollama" | "openai"; baseUrl?: string; model?: string; tenantId?: string },
   ) {
     this.tenantId = config?.tenantId ?? "";
-    this.ollamaUrl = config?.ollamaUrl ?? "http://localhost:11434";
-    this.model = config?.model ?? "nomic-embed-text";
+    this.provider = config?.provider ?? "openai";
+    if (this.provider === "openai") {
+      this.baseUrl = config?.baseUrl ?? "http://127.0.0.1:1234";
+      this.model = config?.model ?? "text-embedding-nomic-embed-text-v1.5";
+    } else {
+      this.baseUrl = config?.baseUrl ?? "http://localhost:11434";
+      this.model = config?.model ?? "nomic-embed-text";
+    }
   }
 
-  /** Check if Ollama embedding model is reachable */
+  /** Check if the embedding model is reachable */
   async checkHealth(): Promise<boolean> {
     const now = Date.now();
     if (now - this.lastHealthCheck < this.healthCheckIntervalMs) return this.available;
     this.lastHealthCheck = now;
 
     try {
-      const resp = await fetch(`${this.ollamaUrl}/api/tags`, {
-        signal: AbortSignal.timeout(3000),
-      });
-      if (!resp.ok) { this.available = false; return false; }
-      const data = await resp.json() as { models?: Array<{ name: string }> };
-      this.available = data.models?.some(m => m.name.startsWith(this.model)) ?? false;
-      if (!this.available) {
-        console.log(`[EmbeddingStore] Model ${this.model} not found in Ollama. Pull it with: ollama pull ${this.model}`);
+      if (this.provider === "openai") {
+        const resp = await fetch(`${this.baseUrl}/v1/models`, {
+          signal: AbortSignal.timeout(3000),
+        });
+        if (!resp.ok) { this.available = false; return false; }
+        const data = await resp.json() as { data?: Array<{ id: string }> };
+        this.available = data.data?.some(m => m.id === this.model || m.id.includes(this.model)) ?? false;
+        if (!this.available) {
+          console.log(`[EmbeddingStore] Model ${this.model} not found at ${this.baseUrl}`);
+        }
+      } else {
+        const resp = await fetch(`${this.baseUrl}/api/tags`, {
+          signal: AbortSignal.timeout(3000),
+        });
+        if (!resp.ok) { this.available = false; return false; }
+        const data = await resp.json() as { models?: Array<{ name: string }> };
+        this.available = data.models?.some(m => m.name.startsWith(this.model)) ?? false;
+        if (!this.available) {
+          console.log(`[EmbeddingStore] Model ${this.model} not found in Ollama. Pull it with: ollama pull ${this.model}`);
+        }
       }
       return this.available;
     } catch {
@@ -81,23 +99,36 @@ export class EmbeddingStore {
     }
   }
 
-  /** Generate embedding vector from text via Ollama */
+  /** Generate embedding vector from text */
   private async embed(text: string): Promise<number[] | null> {
     if (!this.available) return null;
 
     try {
-      const resp = await fetch(`${this.ollamaUrl}/api/embed`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: this.model, input: text }),
-        signal: AbortSignal.timeout(5000),
-      });
+      let vec: number[] | null = null;
 
-      if (!resp.ok) return null;
+      if (this.provider === "openai") {
+        const resp = await fetch(`${this.baseUrl}/v1/embeddings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: this.model, input: [text] }),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!resp.ok) return null;
+        const data = await resp.json() as { data?: Array<{ embedding: number[] }> };
+        vec = data.data?.[0]?.embedding ?? null;
+      } else {
+        const resp = await fetch(`${this.baseUrl}/api/embed`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: this.model, input: text }),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!resp.ok) return null;
+        const data = await resp.json() as { embeddings?: number[][] };
+        vec = data.embeddings?.[0] ?? null;
+      }
 
-      const data = await resp.json() as { embeddings?: number[][] };
-      const vec = data.embeddings?.[0];
-      if (!vec || vec.length !== EMBED_DIM) return null;
+      if (!vec) return null;
       return vec;
     } catch {
       return null;
