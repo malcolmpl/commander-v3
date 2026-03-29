@@ -1,191 +1,166 @@
 /**
- * Migration script: SQLite → PostgreSQL
+ * One-shot migration: SQLite (commander.db) → PostgreSQL.
+ * Reads all data from SQLite tables, inserts into PG with tenant_id = 'local'.
  *
- * Reads all data from a SQLite commander.db and inserts it into PostgreSQL
- * with a specified tenant_id. Handles type conversions.
+ * Prerequisites:
+ *   1. PostgreSQL running (docker compose up -d)
+ *   2. Tables created (bunx drizzle-kit push)
  *
- * Usage: bun run scripts/migrate-sqlite-to-pg.ts --sqlite ./commander.db --tenant-id <id>
- *
- * Env: DATABASE_URL=postgresql://humbrol2:pass@10.0.0.54:5432/commander
+ * Usage: bun run scripts/migrate-sqlite-to-pg.ts [--db-url <pg_url>] [--sqlite <path>]
  */
 
 import { Database } from "bun:sqlite";
 import postgres from "postgres";
 import { parseArgs } from "util";
 
-const { values: args } = parseArgs({
-  args: process.argv.slice(2),
+const args = parseArgs({
   options: {
+    "db-url": { type: "string", default: "" },
     sqlite: { type: "string", default: "commander.db" },
-    "tenant-id": { type: "string", default: "" },
-    "database-url": { type: "string", default: "" },
-    "dry-run": { type: "boolean", default: false },
+    "tenant-id": { type: "string", default: "local" },
   },
-  strict: false,
 });
 
-const sqlitePath = String(args.sqlite);
-const tenantId = String(args["tenant-id"]);
-const databaseUrl = String(args["database-url"]) || process.env.DATABASE_URL || "postgresql://humbrol2:3e1779ab4980bd4c7133eb457f8d3a0b@10.0.0.54:5432/commander";
-const dryRun = args["dry-run"] ?? false;
-
-if (!tenantId) {
-  console.error("Error: --tenant-id is required");
+// Resolve PG URL from args, env, or config.toml
+async function resolvePgUrl(): Promise<string> {
+  if (args.values["db-url"]) return args.values["db-url"]!;
+  if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
+  // Try config.toml
+  try {
+    const toml = await import("toml");
+    const text = await Bun.file("config.toml").text();
+    const config = toml.parse(text);
+    if (config.database?.url?.startsWith("postgresql://")) return config.database.url;
+  } catch {}
+  console.error("No PostgreSQL URL found. Use --db-url, DATABASE_URL env, or config.toml [database] url");
   process.exit(1);
 }
 
-console.log(`=== SQLite → PostgreSQL Migration ===`);
-console.log(`Source:    ${sqlitePath}`);
-console.log(`Target:    ${databaseUrl.replace(/:[^:@]+@/, ':****@')}`);
-console.log(`Tenant:    ${tenantId}`);
-console.log(`Dry run:   ${dryRun}`);
-console.log();
+const pgUrl = await resolvePgUrl();
+const sqlitePath = args.values.sqlite!;
+const tenantId = args.values["tenant-id"]!;
 
-// Tables to migrate (in dependency order)
-const TABLES = [
-  "cache",
-  "timed_cache",
-  "bot_sessions",
-  "bot_settings",
-  "bot_skills",
-  "fleet_settings",
-  "commander_memory",
-  "bandit_weights",
-  "poi_cache",
-  "goals",
-  "credit_history",
-  "decision_log",
-  "state_snapshots",
-  "episodes",
-  "market_history",
-  "commander_log",
-  "llm_decisions",
-  "financial_events",
-  "trade_log",
-  "faction_transactions",
-  "activity_log",
-  "bandit_episodes",
-  "outcome_embeddings",
+console.log(`[Migration] SQLite: ${sqlitePath}`);
+console.log(`[Migration] PostgreSQL: ${pgUrl.replace(/:[^@]+@/, ":***@")}`);
+console.log(`[Migration] Tenant ID: ${tenantId}`);
+
+// Open connections
+const sqlite = new Database(sqlitePath, { readonly: true });
+const pg = postgres(pgUrl, { max: 1 });
+
+// Helper: get row count from SQLite
+function sqliteCount(table: string): number {
+  return (sqlite.query(`SELECT COUNT(*) as cnt FROM ${table}`).get() as any).cnt;
+}
+
+// Helper: get all rows from SQLite
+function sqliteAll(table: string): Record<string, unknown>[] {
+  return sqlite.query(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
+}
+
+// Migration definitions
+interface MigrationDef {
+  table: string;
+  /** Columns to skip when inserting (e.g. auto-increment id, old tenant_id) */
+  skipColumns: string[];
+}
+
+const migrations: MigrationDef[] = [
+  { table: "bot_sessions", skipColumns: ["tenant_id"] },
+  { table: "commander_memory", skipColumns: ["tenant_id"] },
+  { table: "market_history", skipColumns: ["id", "tenant_id"] },
+  { table: "commander_log", skipColumns: ["id", "tenant_id"] },
+  { table: "credit_history", skipColumns: ["id", "tenant_id"] },
+  { table: "llm_decisions", skipColumns: ["id", "tenant_id"] },
+  { table: "faction_transactions", skipColumns: ["id", "tenant_id"] },
+  { table: "cache", skipColumns: ["tenant_id"] },
+  { table: "timed_cache", skipColumns: ["tenant_id"] },
 ];
 
-// Open SQLite
-const sqlite = new Database(sqlitePath, { readonly: true });
+let totalMigrated = 0;
 
-// Open PostgreSQL
-const pg = postgres(databaseUrl, { max: 5 });
-
-async function migrateTable(tableName: string): Promise<number> {
-  // Get all rows from SQLite
-  let rows: any[];
+for (const def of migrations) {
+  let count: number;
   try {
-    rows = sqlite.query(`SELECT * FROM ${tableName}`).all();
-  } catch (e: any) {
-    console.log(`  ⚠ Table ${tableName} not found in SQLite, skipping`);
-    return 0;
+    count = sqliteCount(def.table);
+  } catch {
+    console.log(`[Migration] ${def.table}: not found in SQLite — skipping`);
+    continue;
+  }
+  if (count === 0) {
+    console.log(`[Migration] ${def.table}: 0 rows — skipping`);
+    continue;
   }
 
-  if (rows.length === 0) {
-    console.log(`  ○ ${tableName}: empty, skipping`);
-    return 0;
-  }
+  console.log(`[Migration] ${def.table}: ${count} rows — migrating...`);
+  const rows = sqliteAll(def.table);
 
-  // Get column names from first row
-  const columns = Object.keys(rows[0]);
+  // Determine columns from first row, excluding skipColumns
+  const skipSet = new Set(def.skipColumns);
+  const allColumns = Object.keys(rows[0]).filter((c) => !skipSet.has(c));
+  const pgColumns = ["tenant_id", ...allColumns];
 
-  // Add tenant_id
-  const pgColumns = ["tenant_id", ...columns];
-
-  if (dryRun) {
-    console.log(`  ✓ ${tableName}: ${rows.length} rows (dry run)`);
-    return rows.length;
-  }
-
-  // Batch insert (chunks of 500)
-  const BATCH_SIZE = 500;
+  // Batch insert (100 rows at a time)
+  const BATCH_SIZE = 100;
   let inserted = 0;
 
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const batch = rows.slice(i, i + BATCH_SIZE);
-
-    // Build VALUES clause
-    const values = batch.map(row => {
-      const vals = pgColumns.map(col => {
-        if (col === "tenant_id") return tenantId;
-        return row[col] ?? null;
-      });
+    const values = batch.map((row) => {
+      const vals: unknown[] = [tenantId];
+      for (const col of allColumns) {
+        vals.push(row[col] ?? null);
+      }
       return vals;
     });
 
-    // Use postgres.js for batch insert
-    const placeholderRows = values.map((vals, rowIdx) => {
-      const placeholders = vals.map((_, colIdx) => `$${rowIdx * vals.length + colIdx + 1}`);
-      return `(${placeholders.join(", ")})`;
-    });
-
+    // Build parameterized INSERT
+    const placeholders = values
+      .map(
+        (_, rowIdx) =>
+          `(${pgColumns.map((_, colIdx) => `$${rowIdx * pgColumns.length + colIdx + 1}`).join(", ")})`
+      )
+      .join(", ");
     const flatValues = values.flat();
-    const columnsStr = pgColumns.map(c => `"${c}"`).join(", ");
+    const colNames = pgColumns.map((c) => `"${c}"`).join(", ");
 
-    try {
-      await pg.unsafe(
-        `INSERT INTO ${tableName} (${columnsStr}) VALUES ${placeholderRows.join(", ")} ON CONFLICT DO NOTHING`,
-        flatValues,
-      );
-      inserted += batch.length;
-    } catch (e: any) {
-      console.error(`  ✗ ${tableName} batch ${i}-${i + batch.length}: ${e.message}`);
-      // Try one-by-one for this batch
-      for (const row of batch) {
-        try {
-          const vals = pgColumns.map(col => col === "tenant_id" ? tenantId : row[col] ?? null);
-          const placeholders = vals.map((_, i) => `$${i + 1}`);
-          await pg.unsafe(
-            `INSERT INTO ${tableName} (${columnsStr}) VALUES (${placeholders.join(", ")}) ON CONFLICT DO NOTHING`,
-            vals,
-          );
-          inserted++;
-        } catch (e2: any) {
-          // Skip individual row errors
-        }
-      }
-    }
+    await pg.unsafe(
+      `INSERT INTO "${def.table}" (${colNames}) VALUES ${placeholders} ON CONFLICT DO NOTHING`,
+      flatValues as any[]
+    );
+    inserted += batch.length;
   }
 
-  console.log(`  ✓ ${tableName}: ${inserted}/${rows.length} rows migrated`);
-  return inserted;
+  console.log(`[Migration] ${def.table}: ${inserted} rows inserted`);
+  totalMigrated += inserted;
 }
 
-async function main() {
-  console.log("Migrating tables...\n");
-
-  let totalMigrated = 0;
-  for (const table of TABLES) {
-    totalMigrated += await migrateTable(table);
+// Reset sequences for tables with SERIAL PKs
+const serialTables = [
+  "market_history",
+  "commander_log",
+  "credit_history",
+  "llm_decisions",
+  "faction_transactions",
+];
+for (const table of serialTables) {
+  try {
+    await pg.unsafe(
+      `SELECT setval(pg_get_serial_sequence('"${table}"', 'id'), COALESCE((SELECT MAX(id) FROM "${table}"), 0) + 1, false)`
+    );
+  } catch {
+    // Table might be empty or sequence might not exist
   }
-
-  console.log(`\n=== Migration Complete ===`);
-  console.log(`Total: ${totalMigrated} rows migrated across ${TABLES.length} tables`);
-
-  // Verify counts
-  console.log("\nVerifying...");
-  for (const table of TABLES) {
-    try {
-      const [{ count }] = await pg`SELECT COUNT(*) as count FROM ${pg(table)} WHERE tenant_id = ${tenantId}`;
-      const sqliteCount = (sqlite.query(`SELECT COUNT(*) as count FROM ${table}`).get() as any)?.count ?? 0;
-      const match = Number(count) === sqliteCount ? "✓" : "⚠";
-      if (sqliteCount > 0) {
-        console.log(`  ${match} ${table}: PG=${count}, SQLite=${sqliteCount}`);
-      }
-    } catch {
-      // Table may not exist in one or the other
-    }
-  }
-
-  sqlite.close();
-  await pg.end();
-  console.log("\nDone.");
 }
 
-main().catch(err => {
-  console.error("Migration failed:", err);
-  process.exit(1);
-});
+console.log(`\n[Migration] Done! Total rows migrated: ${totalMigrated}`);
+
+// Verify
+console.log("\n[Verification]");
+for (const def of migrations) {
+  const result = await pg.unsafe(`SELECT COUNT(*) as cnt FROM "${def.table}"`);
+  console.log(`  ${def.table}: ${result[0].cnt} rows in PG`);
+}
+
+sqlite.close();
+await pg.end();
