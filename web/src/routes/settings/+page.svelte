@@ -19,6 +19,7 @@
 
 	const goalTypes = [
 		"maximize_income",
+		"maximize_profit",
 		"explore_region",
 		"prepare_for_war",
 		"level_skills",
