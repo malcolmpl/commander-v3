@@ -26,6 +26,12 @@ export class GameCache {
   private shipyardCache = new Map<string, { ships: Array<{ id: string; name: string; classId: string; price: number }>; fetchedAt: number }>();
   marketDirty = false;
 
+  // ── In-memory mirrors for sync access (populated by set* methods) ──
+  private marketPricesMemory = new Map<string, MarketPrice[]>();
+  private marketInsightsMemory = new Map<string, MarketInsight[]>();
+  private systemDetailMemory = new Map<string, StarSystem>();
+  private catalogItemMemory = new Map<string, CatalogItem>();
+
   // ── Fleet-wide query dedup ──
   // In-flight promise dedup: if bot A is already fetching viewMarket for station X,
   // bot B will await the same promise instead of firing a second API call.
@@ -430,7 +436,11 @@ export class GameCache {
       const hasModuleFields = raw.some(r => "cpuCost" in r && (r.cpuCost as number) > 0);
       const hasModules = raw.some(r => r.category === "module");
       const needsRefresh = hasModules && !hasModuleFields;
-      if (raw.length >= 50 && !needsRefresh) return raw.map(normalizeCatalogItem);
+      if (raw.length >= 50 && !needsRefresh) {
+        const items = raw.map(normalizeCatalogItem);
+        this.indexCatalogItems(items);
+        return items;
+      }
     }
 
     const categories = ["ore", "refined", "component", "module", "artifact", "fuel", "ammo", "equipment"];
@@ -562,13 +572,24 @@ export class GameCache {
 
   // ── Market Prices (timed cache) ──
 
-  async getMarketPrices(stationId: string): Promise<MarketPrice[] | null> {
+  /** Sync getter — returns from in-memory mirror (populated by setMarketPrices) */
+  getMarketPrices(stationId: string): MarketPrice[] | null {
+    return this.marketPricesMemory.get(stationId) ?? null;
+  }
+
+  /** Async getter — checks Redis/DB for cold cache */
+  async getMarketPricesAsync(stationId: string): Promise<MarketPrice[] | null> {
+    const mem = this.marketPricesMemory.get(stationId);
+    if (mem) return mem;
     const cached = await this.getTimed(`market:${stationId}`);
     if (!cached) return null;
-    return JSON.parse(cached);
+    const parsed = JSON.parse(cached);
+    this.marketPricesMemory.set(stationId, parsed);
+    return parsed;
   }
 
   async setMarketPrices(stationId: string, prices: MarketPrice[], tick: number, ttlMs = 1_800_000): Promise<void> {
+    this.marketPricesMemory.set(stationId, prices);
     await this.setTimed(`market:${stationId}`, JSON.stringify(prices), ttlMs);
     this.marketFetchedAt.set(stationId, Date.now());
     this.marketDirty = true;
@@ -580,22 +601,22 @@ export class GameCache {
 
   // ── Market Insights ──
 
-  async getMarketInsights(stationId: string): Promise<MarketInsight[] | null> {
-    const cached = await this.getTimed(`insights:${stationId}`);
-    if (!cached) return null;
-    return JSON.parse(cached);
+  /** Sync getter — returns from in-memory mirror */
+  getMarketInsights(stationId: string): MarketInsight[] | null {
+    return this.marketInsightsMemory.get(stationId) ?? null;
   }
 
   async setMarketInsights(stationId: string, insights: MarketInsight[], ttlMs = 1_800_000): Promise<void> {
+    this.marketInsightsMemory.set(stationId, insights);
     await this.setTimed(`insights:${stationId}`, JSON.stringify(insights), ttlMs);
     this.insightFetchedAt.set(stationId, Date.now());
   }
 
-  async getAllCachedInsights(): Promise<MarketInsight[]> {
+  /** Sync — returns all cached insights from memory */
+  getAllCachedInsights(): MarketInsight[] {
     const all: MarketInsight[] = [];
-    for (const stationId of this.insightFetchedAt.keys()) {
-      const insights = await this.getMarketInsights(stationId);
-      if (insights) all.push(...insights);
+    for (const [, insights] of this.marketInsightsMemory) {
+      all.push(...insights);
     }
     return all;
   }
@@ -607,13 +628,24 @@ export class GameCache {
 
   // ── System Details ──
 
-  async getSystemDetail(systemId: string): Promise<StarSystem | null> {
+  /** Sync getter — returns from in-memory mirror */
+  getSystemDetail(systemId: string): StarSystem | null {
+    return this.systemDetailMemory.get(systemId) ?? null;
+  }
+
+  /** Async getter for cold cache */
+  async getSystemDetailAsync(systemId: string): Promise<StarSystem | null> {
+    const mem = this.systemDetailMemory.get(systemId);
+    if (mem) return mem;
     const cached = await this.getTimed(`system:${systemId}`);
     if (!cached) return null;
-    return JSON.parse(cached);
+    const parsed = JSON.parse(cached);
+    this.systemDetailMemory.set(systemId, parsed);
+    return parsed;
   }
 
   async setSystemDetail(systemId: string, system: StarSystem, ttlMs = 3_600_000): Promise<void> {
+    this.systemDetailMemory.set(systemId, system);
     await this.setTimed(`system:${systemId}`, JSON.stringify(system), ttlMs);
     await this.setStatic(`system_detail:${systemId}`, JSON.stringify(system), "persistent");
   }
@@ -702,11 +734,16 @@ export class GameCache {
   }
 
   /** Get a catalog item by ID (from cached item catalog) */
-  async getCatalogItem(itemId: string): Promise<CatalogItem | null> {
-    const cached = await this.getStatic("item_catalog", this.gameVersion);
-    if (!cached) return null;
-    const items = JSON.parse(cached) as CatalogItem[];
-    return items.find(i => i.id === itemId) ?? null;
+  /** Sync getter — returns from in-memory catalog cache */
+  getCatalogItem(itemId: string): CatalogItem | null {
+    return this.catalogItemMemory.get(itemId) ?? null;
+  }
+
+  /** Populate in-memory catalog index (call after getItemCatalog) */
+  indexCatalogItems(items: CatalogItem[]): void {
+    for (const item of items) {
+      this.catalogItemMemory.set(item.id, item);
+    }
   }
 
   /** Find a station that sells a specific item (from cached market scans) */
