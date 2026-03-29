@@ -407,28 +407,26 @@ export class ChatIntelligence {
     const userPrompt = await this.buildChatPrompt(msg, channel, context);
 
     try {
-      const resp = await fetch(`${this.ollamaUrl}/api/chat`, {
+      const resp = await fetch(`${this.ollamaUrl}/v1/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: this.ollamaModel,
-          think: false,
           stream: false,
           messages: [
             { role: "system", content: systemPrompt },
-            // Include conversation history for this player (multi-turn)
             ...this.getConversationHistory(msg.username),
             { role: "user", content: userPrompt },
           ],
-          options: { num_predict: 150 }, // Short replies — chat, not essays
+          max_tokens: 150,
         }),
         signal: AbortSignal.timeout(15_000),
       });
 
       if (!resp.ok) return null;
 
-      const data = await resp.json() as { message?: { content?: string } };
-      let reply = data.message?.content?.trim() ?? "";
+      const data = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
+      let reply = data.choices?.[0]?.message?.content?.trim() ?? "";
 
       // Clean up: remove quotes, thinking markers, markdown
       reply = reply.replace(/^["']|["']$/g, "").replace(/^\*.*?\*\s*/g, "").trim();

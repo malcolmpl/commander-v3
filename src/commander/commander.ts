@@ -1312,18 +1312,17 @@ export class Commander {
     const systemPrompt = buildStrategicSystemPrompt();
 
     try {
-      const response = await fetch(`${baseUrl}/api/chat`, {
+      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model,
-          think: false,
           stream: false,
           messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: userPrompt },
           ],
-          options: { num_predict: 512 },
+          max_tokens: 512,
         }),
         signal: AbortSignal.timeout(30_000),
       });
@@ -1333,8 +1332,8 @@ export class Commander {
         return null;
       }
 
-      const data = await response.json() as { message?: { content?: string } };
-      const responseText = data.message?.content ?? "";
+      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      const responseText = data.choices?.[0]?.message?.content ?? "";
       if (!responseText) {
         console.log(`[Commander] Strategic LLM returned empty response`);
         return null;
