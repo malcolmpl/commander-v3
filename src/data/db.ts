@@ -18,16 +18,16 @@ import { Database } from "bun:sqlite";
 import { drizzle as drizzleSqlite } from "drizzle-orm/bun-sqlite";
 import * as sqliteSchema from "./schema-sqlite";
 
-/** Unified DB type — both drivers expose the same Drizzle API surface */
-export type DB = ReturnType<typeof drizzlePg> | ReturnType<typeof drizzleSqlite>;
+/** PostgreSQL database type */
+export type DB = ReturnType<typeof drizzlePg>;
 
 export interface DatabaseConnection {
   db: DB;
   driver: "postgresql" | "sqlite";
   /** Close the connection pool / database */
   close: () => Promise<void>;
-  /** Raw SQL client for PostgreSQL, raw Database for SQLite */
-  raw: postgres.Sql | Database;
+  /** Raw SQL client for PostgreSQL */
+  raw: postgres.Sql;
 }
 
 /**
