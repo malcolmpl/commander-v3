@@ -54,7 +54,8 @@
 		{ href: "/economy", label: "Economy", key: "5" },
 		{ href: "/faction", label: "Faction", key: "6" },
 		{ href: "/training", label: "Training", key: "7" },
-		{ href: "/manual", label: "Manual", key: "8" },
+		{ href: "/advisor", label: "Advisor", key: "8" },
+		{ href: "/manual", label: "Manual", key: "9" },
 	];
 
 	function isActive(href: string, pathname: string): boolean {

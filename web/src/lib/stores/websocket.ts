@@ -73,6 +73,8 @@ export const socialForum = writable<SocialForumThread[]>([]);
 export const socialDMs = writable<SocialDM[]>([]);
 export const brainDecisionStats = writable<BrainDecisionStats | null>(null);
 export const workOrders = writable<WorkOrderInfo[]>([]);
+export const fleetAdvisor = writable<any>(null);
+export const dangerMapData = writable<Array<{ systemId: string; score: number; attacks: number; lastAttack: number }>>([]);
 
 // Galaxy detail (enriched with market data)
 export interface GalaxyDetailData {
@@ -258,6 +260,14 @@ function handleMessage(event: MessageEvent) {
 
       case "brain_decision_stats":
         brainDecisionStats.set(msg.stats);
+        break;
+
+      case "fleet_advisor_update":
+        fleetAdvisor.set(msg.advisor);
+        break;
+
+      case "danger_map_update":
+        dangerMapData.set(msg.systems);
         break;
 
       case "catalog_data":

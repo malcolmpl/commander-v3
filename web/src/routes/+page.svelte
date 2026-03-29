@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { bots, fleetStats, commanderLog, activityLog, connectionState, economy } from "$stores/websocket";
 	import CreditsChart from "$lib/components/CreditsChart.svelte";
+	import FleetAdvisorCard from "$lib/components/FleetAdvisorCard.svelte";
 
 	const ROLE_LABELS: Record<string, string> = {
 		ore_miner: "Miner-Ore",
@@ -196,6 +197,9 @@
 
 		<!-- Right sidebar (merged from Activity page) -->
 		<div class="space-y-3">
+			<!-- Fleet Advisor -->
+			<FleetAdvisorCard />
+
 			<!-- Commander thoughts -->
 			<div class="card p-4">
 				<h3 class="text-xs text-chrome-silver uppercase tracking-wider mb-2">Commander Thoughts</h3>
