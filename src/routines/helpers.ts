@@ -7,6 +7,7 @@ import type { BotContext } from "../bot/types";
 import type { RoutineYield } from "../events/types";
 import { typedYield } from "../events/types";
 import type { TravelResult, MiningYield, TradeResult, MarketOrder, MarketPrice } from "../types/game";
+import type { DangerMap } from "../commander/danger-map";
 import {
   FUEL_REFUEL_THRESHOLD, FUEL_PREDEPARTURE_THRESHOLD, FUEL_CELL_RESERVE,
   FUEL_CELL_MAX_PRICE, FUEL_SAFETY_MARGIN, FUEL_LOW_BURN_THRESHOLD,
@@ -211,6 +212,92 @@ export async function navigateToPoi(ctx: BotContext, poiId: string): Promise<voi
   }
 
   await navigateTo(ctx, systemId, poiId);
+}
+
+/**
+ * Navigate to a target system using danger-aware weighted pathfinding.
+ * If no dangerMap is provided (or already at target), falls back to standard navigateTo.
+ * Performs a hull safety check before each jump and aborts to emergency dock if critical.
+ */
+export async function navigateSafe(
+  ctx: BotContext,
+  targetSystemId: string,
+  targetPoiId?: string,
+  dangerMap?: DangerMap,
+): Promise<void> {
+  if (!dangerMap || ctx.player.currentSystem === targetSystemId) {
+    await navigateTo(ctx, targetSystemId, targetPoiId);
+    return;
+  }
+
+  const costFn = (sysId: string) => {
+    const danger = dangerMap.getScore(sysId);
+    return 1.0 + danger * 5.0;
+  };
+
+  const path = ctx.galaxy.findWeightedPath(
+    ctx.player.currentSystem,
+    targetSystemId,
+    costFn,
+  );
+
+  if (!path || path.length <= 1) {
+    // Fallback to standard nav
+    await navigateTo(ctx, targetSystemId, targetPoiId);
+    return;
+  }
+
+  // Undock first if docked - refuel before leaving
+  if (ctx.player.dockedAtBase) {
+    await ensureFuelSafety(ctx);
+    log(ctx, `undocking from ${ctx.player.dockedAtBase}`);
+    try {
+      await ctx.api.undock();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("not_docked")) {
+        log(ctx, "already undocked (stale state)");
+      } else {
+        throw err;
+      }
+    }
+    await ctx.refreshState();
+  }
+
+  const jumpsNeeded = path.length - 1;
+  log(ctx, `navigating (safe) ${ctx.player.currentSystem} → ${targetSystemId} (${jumpsNeeded} jump(s))`);
+
+  // Skip first element (current system)
+  for (let i = 1; i < path.length; i++) {
+    if (ctx.shouldStop) return;
+    const issue = safetyCheck(ctx);
+    if (issue) {
+      await handleEmergency(ctx);
+      return;
+    }
+    log(ctx, `jumping to ${path[i]} (${i}/${jumpsNeeded})`);
+    try {
+      await ctx.api.jump(path[i]);
+    } catch (jumpErr) {
+      const msg = jumpErr instanceof Error ? jumpErr.message : String(jumpErr);
+      if (msg.includes("already_here") || msg.includes("already in")) {
+        log(ctx, `already in ${path[i]}, skipping`);
+        continue;
+      }
+      throw jumpErr;
+    }
+    await ctx.refreshState();
+    try {
+      await fleetGetSystem(ctx);
+    } catch (err) {
+      logWarn(ctx, `failed to update system detail after jump: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  if (targetPoiId && ctx.player.currentSystem === targetSystemId) {
+    await travelToPoi(ctx, targetPoiId);
+    await dockAtCurrent(ctx);
+  }
 }
 
 // ── System Data ──
@@ -1624,5 +1711,78 @@ export async function depositExcessCredits(ctx: BotContext): Promise<{ deposited
     log(ctx, `faction deposit failed: ${err instanceof Error ? err.message : String(err)}`);
     return { deposited: 0, message: "" };
   }
+}
+
+// ── Centralized Logistics ──
+
+/**
+ * Collect scattered cargo from personal storage at the current docked station.
+ * Withdraws non-protected items up to free cargo capacity.
+ * Returns the count of items collected (item types, not units).
+ */
+export async function collectScatteredCargo(ctx: BotContext): Promise<number> {
+  if (!ctx.player.dockedAtBase) return 0;
+
+  let collected = 0;
+  try {
+    const storage = await ctx.api.viewStorage();
+    if (!storage || storage.length === 0) return 0;
+
+    for (const item of storage) {
+      if (ctx.shouldStop) break;
+      if (isProtectedItem(item.itemId)) continue;
+      if (item.quantity <= 0) continue;
+
+      const freeWeight = ctx.cargo.freeSpace(ctx.ship);
+      if (freeWeight <= 0) break;
+
+      const itemSize = ctx.cargo.getItemSize(ctx.ship, item.itemId);
+      const maxByWeight = Math.floor(freeWeight / Math.max(1, itemSize));
+      if (maxByWeight <= 0) continue;
+
+      const withdrawQty = Math.min(item.quantity, maxByWeight);
+      try {
+        await ctx.api.withdrawItems(item.itemId, withdrawQty);
+        await ctx.refreshState();
+        log(ctx, `collected ${withdrawQty}x ${item.itemId} from personal storage`);
+        collected++;
+      } catch (err) {
+        logWarn(ctx, `collect ${item.itemId} from storage failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } catch (err) {
+    logWarn(ctx, `collectScatteredCargo: storage check failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return collected;
+}
+
+/**
+ * Deposit all non-protected cargo items to faction storage.
+ * Returns the count of item types deposited.
+ * Invalidates faction storage cache after deposit.
+ */
+export async function depositAllToFaction(ctx: BotContext): Promise<number> {
+  let deposited = 0;
+  const cargoSnapshot = [...ctx.ship.cargo];
+  for (const item of cargoSnapshot) {
+    if (ctx.shouldStop) break;
+    if (isProtectedItem(item.itemId)) continue;
+    if (item.quantity <= 0) continue;
+
+    try {
+      await ctx.api.factionDepositItems(item.itemId, item.quantity);
+      ctx.cache.invalidateFactionStorage();
+      ctx.eventBus.emit({
+        type: "deposit", botId: ctx.botId, itemId: item.itemId, quantity: item.quantity,
+        target: "faction", stationId: ctx.player.dockedAtBase ?? "",
+      });
+      log(ctx, `deposited ${item.quantity}x ${item.itemId} to faction storage`);
+      deposited++;
+    } catch (err) {
+      logWarn(ctx, `depositAllToFaction: deposit ${item.itemId} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (deposited > 0) await ctx.refreshState();
+  return deposited;
 }
 

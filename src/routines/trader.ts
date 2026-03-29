@@ -44,6 +44,8 @@ import {
   fleetViewMarket,
   fleetGetSystem,
   fleetViewFactionStorage,
+  collectScatteredCargo,
+  depositAllToFaction,
   MAX_MATERIAL_BUY_PRICE,
   INSIGHT_GATE_PRICE,
 } from "./helpers";
@@ -726,25 +728,59 @@ export async function* trader(ctx: BotContext): AsyncGenerator<RoutineYield, voi
           sellStation = altStation;
         } catch (altErr) {
           yield `alternate route also failed: ${altErr instanceof Error ? altErr.message : String(altErr)}`;
-          // Last resort: sell at nearest reachable station
-          try {
-            await findAndDock(ctx);
-            await sellAllCargo(ctx);
-            await ctx.refreshState();
-            yield "sold cargo at nearest station";
-          } catch { yield "all sell attempts failed — cargo stranded"; }
+          // Try faction storage before selling at random station
+          const factionStation = ctx.fleetConfig.factionStorageStation || ctx.fleetConfig.homeBase;
+          let depositedToFaction = false;
+          if (factionStation) {
+            try {
+              yield "returning cargo to faction storage";
+              await navigateAndDock(ctx, factionStation);
+              const nDeposited = await depositAllToFaction(ctx);
+              if (nDeposited > 0) {
+                yield `deposited ${nDeposited} item type(s) to faction storage (failed trade return)`;
+                depositedToFaction = true;
+              }
+            } catch (fErr) {
+              yield `faction return failed: ${fErr instanceof Error ? fErr.message : String(fErr)}`;
+            }
+          }
+          if (!depositedToFaction) {
+            try {
+              await findAndDock(ctx);
+              await sellAllCargo(ctx);
+              await ctx.refreshState();
+              yield "sold cargo at nearest station";
+            } catch { yield "all sell attempts failed — cargo stranded"; }
+          }
           yield typedYield("cycle_complete", { type: "cycle_complete", botId: ctx.botId, routine: "trader" });
           return;
         }
       } else {
-        // No cached alternate — sell at nearest station
-        yield "no alternate buyers known — selling at nearest station";
-        try {
-          await findAndDock(ctx);
-          await sellAllCargo(ctx);
-          await ctx.refreshState();
-          yield "sold cargo at fallback station";
-        } catch { yield "fallback sell failed — cargo stranded"; }
+        // No cached alternate — try faction storage first, then nearest station
+        const factionStation = ctx.fleetConfig.factionStorageStation || ctx.fleetConfig.homeBase;
+        let depositedToFaction = false;
+        if (factionStation) {
+          yield "no alternate buyers known — returning cargo to faction storage";
+          try {
+            await navigateAndDock(ctx, factionStation);
+            const nDeposited = await depositAllToFaction(ctx);
+            if (nDeposited > 0) {
+              yield `deposited ${nDeposited} item type(s) to faction storage (failed trade return)`;
+              depositedToFaction = true;
+            }
+          } catch (fErr) {
+            yield `faction return failed: ${fErr instanceof Error ? fErr.message : String(fErr)}`;
+          }
+        }
+        if (!depositedToFaction) {
+          yield "faction return failed — selling at nearest station";
+          try {
+            await findAndDock(ctx);
+            await sellAllCargo(ctx);
+            await ctx.refreshState();
+            yield "sold cargo at fallback station";
+          } catch { yield "fallback sell failed — cargo stranded"; }
+        }
         yield typedYield("cycle_complete", { type: "cycle_complete", botId: ctx.botId, routine: "trader" });
         return;
       }
@@ -1022,6 +1058,18 @@ export async function* trader(ctx: BotContext): AsyncGenerator<RoutineYield, voi
     // ── Service ──
     await refuelIfNeeded(ctx);
     await repairIfNeeded(ctx);
+
+    // ── Collect scattered cargo on empty return trip ──
+    // If cargo is now empty, pick up any personal storage items at current station
+    if (ctx.player.dockedAtBase) {
+      const nonProtectedCargo = ctx.ship.cargo.filter((c) => !isProtectedItem(c.itemId) && c.quantity > 0);
+      if (nonProtectedCargo.length === 0) {
+        const nCollected = await collectScatteredCargo(ctx);
+        if (nCollected > 0) {
+          yield `collected ${nCollected} scattered item type(s) from station storage`;
+        }
+      }
+    }
 
     tripCount++;
     yield typedYield("cycle_complete", { type: "cycle_complete", botId: ctx.botId, routine: "trader" });
