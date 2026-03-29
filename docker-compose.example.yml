@@ -1,0 +1,18 @@
+# SpaceMolt Commander v3 — PostgreSQL
+# Copy to docker-compose.yml and set a real password.
+services:
+  commander-v3-db:
+    image: postgres:16-alpine
+    container_name: commander-v3-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: commander
+      POSTGRES_USER: commander
+      POSTGRES_PASSWORD: CHANGE_ME
+    ports:
+      - "5433:5432"
+    volumes:
+      - commander_pgdata:/var/lib/postgresql/data
+
+volumes:
+  commander_pgdata:
