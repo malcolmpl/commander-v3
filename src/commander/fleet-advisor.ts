@@ -107,7 +107,7 @@ export class FleetAdvisor {
     const totalProfitIncrease = breakdown.reduce((sum, b) => sum + b.estimatedProfitIncrease, 0);
     const estimatedProfitIncreasePct = (totalProfitIncrease / profitPerHour) * 100;
 
-    return {
+    const result: FleetAdvisorResult = {
       currentBots: input.currentBots,
       suggestedBots: totalSuggested,
       breakdown,
@@ -118,5 +118,9 @@ export class FleetAdvisor {
       bottlenecks,
       computedAt: Date.now(),
     };
+
+    console.log(`[FleetAdvisor] ${bottlenecks.length} bottleneck(s), suggest ${result.suggestedBots} bots (+${result.estimatedProfitIncreasePct}% profit)`);
+
+    return result;
   }
 }

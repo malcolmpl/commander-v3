@@ -150,10 +150,15 @@ export class ROIAnalyzer {
   }
 
   comparePaths(paths: ROIEstimate[]): ROIEstimate[] {
-    return [...paths].sort((a, b) => {
+    const sorted = [...paths].sort((a, b) => {
       const aWeighted = a.profitPerTick * a.confidence;
       const bWeighted = b.profitPerTick * b.confidence;
       return bWeighted - aWeighted;
     });
+    if (sorted.length > 0) {
+      const top = sorted[0];
+      console.log(`[ROI] Best path: ${top.type} — ${top.profitPerTick.toFixed(1)} cr/tick (confidence=${(top.confidence * 100).toFixed(0)}%)`);
+    }
+    return sorted;
   }
 }

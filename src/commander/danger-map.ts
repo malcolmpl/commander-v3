@@ -30,6 +30,8 @@ export class DangerMap {
     record.events.push({ score: ATTACK_SCORE, at: timestamp });
     const cutoff = timestamp - this.config.decayHalfLifeMs * 4;
     record.events = record.events.filter(e => e.at > cutoff);
+    const score = this.getScore(systemId);
+    console.log(`[DangerMap] Attack in ${systemId}, score now ${(score * 100).toFixed(0)}% (${record.attacks} total)`);
   }
 
   getScore(systemId: string): number {

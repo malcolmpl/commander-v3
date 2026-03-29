@@ -12,6 +12,7 @@ const NEVER_SCANNED_AGE = 999_999_999;
 export class MarketRotation {
   private stations = new Map<string, StationScanPriority>();
   private assignments = new Map<string, string>();
+  private lastLoggedCoverage = -1;
   private config: MarketRotationConfig;
 
   constructor(config: MarketRotationConfig) {
@@ -27,6 +28,14 @@ export class MarketRotation {
     this.stations.set(stationId, {
       stationId, systemId, ageMs, distanceFromHub, priority, assignedBot,
     });
+    // Log coverage change (max once per significant shift)
+    const coverage = Math.round(this.getCoverage() * 100);
+    if (Math.abs(coverage - this.lastLoggedCoverage) >= 10) {
+      const total = this.stations.size;
+      const fresh = total - this.getStaleCount();
+      console.log(`[MarketRotation] Coverage: ${coverage}% (${fresh}/${total} fresh)`);
+      this.lastLoggedCoverage = coverage;
+    }
   }
 
   getQueue(): StationScanPriority[] {
@@ -41,6 +50,7 @@ export class MarketRotation {
       if (!station.assignedBot) {
         station.assignedBot = botId;
         this.assignments.set(botId, station.stationId);
+        console.log(`[MarketRotation] Assigned ${botId} → ${station.stationId} (age=${Math.round(station.ageMs / 60_000)}min, priority=${station.priority.toFixed(1)})`);
         return station;
       }
     }
