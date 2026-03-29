@@ -169,7 +169,7 @@ export const RedisConfigSchema = z.object({
 export const AppConfigSchema = z.object({
   commander: CommanderConfigSchema.default({}),
   ai: AiConfigSchema.default({}),
-  goals: z.array(GoalSchema).default([]),
+  goals: z.array(GoalSchema).default([{ type: "maximize_profit", priority: 1, params: {} }]),
   fleet: FleetConfigSchema.default({}),
   cache: CacheConfigSchema.default({}),
   server: ServerConfigSchema.default({}),

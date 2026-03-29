@@ -117,6 +117,32 @@ function createArmModel(dim: number, prior?: number[]): ArmModel {
 }
 
 /**
+ * Resize an arm's matrices if its dimension doesn't match current CONTEXT_DIM.
+ * New features get identity-matrix diagonal (neutral regularization) and zero weights.
+ */
+function resizeArm(arm: ArmModel, targetDim: number): ArmModel {
+  const oldDim = arm.theta.length;
+  if (oldDim === targetDim) return arm;
+
+  const theta = new Array(targetDim).fill(0);
+  const b = new Array(targetDim).fill(0);
+  const A: number[][] = Array.from({ length: targetDim }, (_, i) =>
+    Array.from({ length: targetDim }, (_, j) => i === j ? 1 : 0)
+  );
+
+  const copyDim = Math.min(oldDim, targetDim);
+  for (let i = 0; i < copyDim; i++) {
+    theta[i] = arm.theta[i];
+    b[i] = arm.b[i];
+    for (let j = 0; j < copyDim; j++) {
+      A[i][j] = arm.A[i][j];
+    }
+  }
+
+  return { theta, A, b, pulls: arm.pulls };
+}
+
+/**
  * Compute UCB score for an arm given context.
  * score = theta · context + alpha × sqrt(context · A_inv · context)
  */
@@ -370,7 +396,8 @@ export class BanditBrain {
             Array.from({ length: CONTEXT_DIM }, (_, j) => i === j ? 1 : 0)
           );
           const b = theta.map((t, i) => t * Math.max(A[i]?.[i] ?? 1, 0.001));
-          roleModels.set(routine, { theta, A, b, pulls: row.episodeCount });
+          const arm = resizeArm({ theta, A, b, pulls: row.episodeCount }, CONTEXT_DIM);
+          roleModels.set(routine, arm);
         }
         this.models.set(row.role, roleModels);
       } catch {
