@@ -12,6 +12,8 @@ import type { StrategicTrigger } from "./strategic-triggers";
 import type { RetrievedMemory } from "./embedding-store";
 import type { DangerMap } from "./danger-map";
 import type { MarketRotation } from "./market-rotation";
+import { scoreShipForRole } from "../core/ship-fitness";
+import type { ShipClass } from "../types/game";
 
 const VALID_ROUTINES: RoutineName[] = [
   "miner", "crafter", "trader", "quartermaster", "explorer",
@@ -102,6 +104,7 @@ CONSTRAINTS:
 - SPECIALIST ROLES: bots with role= are specialists — only assign them routines compatible with their role. Do NOT reassign specialists to other roles
 - Assign refit when bots have worn modules (modWear dropping) or missing module slots
 - mission_runner is great for XP gain and refreshes market data as a side effect
+- SHIP VALUE: cargoCap shows cargo capacity in units. High-cargo ships (cargoCap>500) are valuable for trading/mining — do NOT waste them on exploration. Use fitness score to judge suitability (higher = better match)
 
 LEARNING:
 - RECENT OUTCOMES section shows credit delta per bot per routine — use this to learn which assignments are profitable
@@ -133,6 +136,7 @@ export interface PromptEnrichment {
   dangerMap?: DangerMap;
   marketRotation?: MarketRotation;
   advisorResult?: FleetAdvisorResult | null;
+  shipCatalog?: ShipClass[];
 }
 
 /** Build user prompt with current fleet state */
@@ -150,7 +154,7 @@ export function buildUserPrompt(input: EvaluationInput, extraContext?: string, e
   }
 
   // Fleet state
-  sections.push(formatFleet(input.fleet.bots));
+  sections.push(formatFleet(input.fleet.bots, enrichment?.shipCatalog));
 
   // Economy
   if (input.economy.deficits.length > 0 || input.economy.surpluses.length > 0) {
@@ -180,7 +184,7 @@ function formatGoals(goals: Goal[]): string {
   return `ACTIVE GOALS:\n${lines.join("\n")}`;
 }
 
-function formatFleet(bots: FleetBotInfo[]): string {
+function formatFleet(bots: FleetBotInfo[], shipCatalog?: ShipClass[]): string {
   if (bots.length === 0) return "FLEET: No bots available";
 
   const lines = bots.map(b => {
@@ -190,9 +194,16 @@ function formatFleet(bots: FleetBotInfo[]): string {
       b.role ? `role=${b.role}` : null,
       `fuel=${b.fuelPct}%`,
       `cargo=${b.cargoPct}%`,
+      `cargoCap=${b.cargoCapacity}`,
       `hull=${b.hullPct}%`,
       `ship=${b.shipClass}`,
       `spd=${b.speed}`,
+      (() => {
+        if (!shipCatalog || !b.routine) return null;
+        const ship = shipCatalog.find(s => s.id === b.shipClass);
+        if (!ship) return null;
+        return `fitness=${b.routine}:${scoreShipForRole(ship, b.routine)}`;
+      })(),
       `system=${b.systemId}`,
       b.docked ? "docked" : "undocked",
     ];

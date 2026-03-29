@@ -1499,6 +1499,7 @@ export class Commander {
         dangerMap: this.dangerMap,
         marketRotation: this.marketRotation,
         advisorResult: this.lastAdvisorResult,
+        shipCatalog: (this.brain as any).shipCatalog ?? [],
       },
     );
 
