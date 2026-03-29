@@ -671,6 +671,9 @@ export class Commander {
     }
 
     // Step 5c: Feed bandit with reward from completed routine cycles
+    if (world) {
+      economySnapshot.dataFreshnessRatio = world.dataFreshnessRatio;
+    }
     this.feedBanditRewards(fleet, economySnapshot);
 
     // Step 6: Build decision record

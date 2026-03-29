@@ -25,7 +25,7 @@ import type { Goal } from "../config/schema";
 // ── Context Feature Extraction ──
 
 /** Number of features in the context vector */
-export const CONTEXT_DIM = 22;
+export const CONTEXT_DIM = 23;
 
 /** Feature names (for debugging) */
 export const FEATURE_NAMES = [
@@ -37,6 +37,7 @@ export const FEATURE_NAMES = [
   "deficit_count", "surplus_count", "net_profit_sign",
   "market_freshness", "fleet_size_log",
   "goal_income", "goal_explore",
+  "danger_level",
 ];
 
 /**
@@ -79,10 +80,11 @@ export function extractContext(
     Math.min(economy.deficits.length / 10, 1),                     // 15: deficit_count
     Math.min(economy.surpluses.length / 10, 1),                    // 16: surplus_count
     economy.netProfit > 0 ? 1 : (economy.netProfit < 0 ? -1 : 0), // 17: net_profit_sign
-    0.5,                                                            // 18: market_freshness (placeholder)
+    Math.min(economy.dataFreshnessRatio ?? 0.5, 1),                // 18: market_freshness (real)
     Math.log10(Math.max(1, fleetSize)) / 2,                        // 19: fleet_size_log
     Math.min(goalIncome, 1),                                        // 20: goal_income
     Math.min(goalExplore, 1),                                       // 21: goal_explore
+    0,                                                              // 22: danger_level (will be wired when danger map is integrated)
   ];
 }
 
