@@ -93,6 +93,9 @@ export function createServer(opts: ServerOptions) {
         if (url.pathname === "/api/public/stats") {
           return handlePublicStats(opts);
         }
+        if (url.pathname === "/api/public/learning") {
+          return handlePublicLearning(opts);
+        }
 
         // Auth endpoints are always public (login/register)
         if (url.pathname === "/api/login" && req.method === "POST") {
@@ -114,11 +117,16 @@ export function createServer(opts: ServerOptions) {
         return handleApiRoute(url, opts);
       }
 
-      // Static files
+      // Static files with cache headers
       const filePath = url.pathname === "/" ? "/index.html" : url.pathname;
       const file = Bun.file(`${opts.staticDir}${filePath}`);
       if (await file.exists()) {
-        return new Response(file);
+        const isAsset = /\.(js|css|woff2?|png|svg|ico)$/.test(filePath);
+        return new Response(file, {
+          headers: {
+            "Cache-Control": isAsset ? "public, max-age=86400, immutable" : "public, max-age=300",
+          },
+        });
       }
 
       // SPA fallback
@@ -571,6 +579,83 @@ async function handleLogin(req: Request, opts: ServerOptions): Promise<Response>
   } catch (err: any) {
     console.error("[Auth] Login error:", err.message);
     return Response.json({ error: "Login failed" }, { status: 500 });
+  }
+}
+
+/** GET /api/public/learning — bandit brain learning data for website display */
+async function handlePublicLearning(opts: ServerOptions): Promise<Response> {
+  const db = opts.db;
+  if (!db) return Response.json({ error: "No database" }, { status: 500 });
+
+  try {
+    // 1. Per-role weights (summarized — average weight per routine per role)
+    const weightsRows = await (db as any).execute(
+      sql`SELECT role, weights, episode_count FROM bandit_weights`
+    ) as Array<{ role: string; weights: string; episode_count: number }>;
+
+    const roleWeights: Record<string, { routines: Record<string, number>; episodes: number }> = {};
+    for (const row of weightsRows ?? []) {
+      const parsed = typeof row.weights === "string" ? JSON.parse(row.weights) : row.weights;
+      const routines: Record<string, number> = {};
+      for (const [routine, weightArr] of Object.entries(parsed)) {
+        const arr = weightArr as number[];
+        routines[routine] = arr.length > 0 ? +(arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2) : 0;
+      }
+      roleWeights[row.role] = { routines, episodes: row.episode_count };
+    }
+
+    // 2. Recent episodes (last 50)
+    const recentEpisodes = await (db as any).execute(
+      sql`SELECT role, routine, reward, reward_breakdown, duration_sec, bot_id, created_at
+          FROM bandit_episodes ORDER BY created_at DESC LIMIT 50`
+    ) as Array<{ role: string; routine: string; reward: number; reward_breakdown: string; duration_sec: number; bot_id: string; created_at: string }>;
+
+    // 3. Top performing combos (avg reward by role+routine, min 3 episodes)
+    const topCombos = await (db as any).execute(
+      sql`SELECT role, routine, COUNT(*) as episodes, ROUND(AVG(reward)::numeric, 2) as avg_reward,
+              ROUND(MAX(reward)::numeric, 2) as max_reward, ROUND(MIN(reward)::numeric, 2) as min_reward
+          FROM bandit_episodes GROUP BY role, routine HAVING COUNT(*) >= 3
+          ORDER BY AVG(reward) DESC LIMIT 20`
+    ) as Array<{ role: string; routine: string; episodes: number; avg_reward: number; max_reward: number; min_reward: number }>;
+
+    // 4. Reward trend (hourly buckets, last 24h)
+    const since24h = Date.now() - 24 * 60 * 60 * 1000;
+    const sinceStr = new Date(since24h).toISOString();
+    const rewardTrend = await (db as any).execute(
+      sql`SELECT DATE_TRUNC('hour', created_at::timestamp) as hour,
+              COUNT(*) as episodes, ROUND(AVG(reward)::numeric, 2) as avg_reward,
+              ROUND(SUM(CASE WHEN reward > 0 THEN 1 ELSE 0 END)::numeric * 100 / COUNT(*), 1) as positive_pct
+          FROM bandit_episodes WHERE created_at >= ${sinceStr}
+          GROUP BY DATE_TRUNC('hour', created_at::timestamp)
+          ORDER BY hour`
+    ) as Array<{ hour: string; episodes: number; avg_reward: number; positive_pct: number }>;
+
+    // 5. Total stats
+    const [totalRow] = await (db as any).execute(
+      sql`SELECT COUNT(*) as total, COUNT(DISTINCT role) as roles, COUNT(DISTINCT routine) as routines,
+              ROUND(AVG(reward)::numeric, 2) as avg_reward
+          FROM bandit_episodes`
+    ) as Array<{ total: number; roles: number; routines: number; avg_reward: number }>;
+
+    return new Response(JSON.stringify({
+      roleWeights,
+      recentEpisodes: (recentEpisodes ?? []).map(e => ({
+        role: e.role, routine: e.routine, reward: +Number(e.reward).toFixed(2),
+        breakdown: typeof e.reward_breakdown === "string" ? JSON.parse(e.reward_breakdown) : e.reward_breakdown,
+        durationSec: +Number(e.duration_sec).toFixed(0), botId: e.bot_id, createdAt: e.created_at,
+      })),
+      topCombos: topCombos ?? [],
+      rewardTrend: (rewardTrend ?? []).map(r => ({
+        hour: r.hour, episodes: +r.episodes, avgReward: +r.avg_reward, positivePct: +r.positive_pct,
+      })),
+      totals: totalRow ? { episodes: +totalRow.total, roles: +totalRow.roles, routines: +totalRow.routines, avgReward: +totalRow.avg_reward } : null,
+      timestamp: new Date().toISOString(),
+    }), {
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    });
+  } catch (err: any) {
+    console.error("[Learning API]", err.message);
+    return Response.json({ error: err.message }, { status: 500 });
   }
 }
 

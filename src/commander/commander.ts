@@ -406,8 +406,16 @@ export class Commander {
 
   private async evaluateAndAssign(): Promise<CommanderDecision> {
     this._evaluating = true;
+    const startMs = performance.now();
     try {
-      return await this._doEvaluateAndAssign();
+      const result = await this._doEvaluateAndAssign();
+      const durationMs = performance.now() - startMs;
+      if (durationMs > 15_000) {
+        console.warn(`[Commander] Slow eval cycle: ${durationMs.toFixed(0)}ms`);
+      } else {
+        console.log(`[Commander] Eval cycle: ${durationMs.toFixed(0)}ms`);
+      }
+      return result;
     } finally {
       this._evaluating = false;
     }

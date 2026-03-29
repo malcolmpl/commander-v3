@@ -483,7 +483,7 @@ async function pollFactionState(deps: BroadcastDeps): Promise<void> {
   try {
     // Storage requires docking; faction_info and faction_rooms work anywhere
     const isDocked = !!readyBot.player?.dockedAtBase;
-    const [factionInfo, storageFull, intelStatus, tradeIntelStatus, factionMissions, factionOrders] = await Promise.all([
+    const results = await Promise.allSettled([
       api.factionInfo().catch((e: unknown) => {
         console.log(`[Broadcast] factionInfo() failed: ${e instanceof Error ? e.message : e}`);
         return null;
@@ -501,6 +501,12 @@ async function pollFactionState(deps: BroadcastDeps): Promise<void> {
       // viewOrders() returns personal orders, not faction orders — don't duplicate here
       Promise.resolve([]),
     ]);
+    const factionInfo = results[0].status === "fulfilled" ? results[0].value : null;
+    const storageFull = results[1].status === "fulfilled" ? results[1].value : null;
+    const intelStatus = results[2].status === "fulfilled" ? results[2].value : null;
+    const tradeIntelStatus = results[3].status === "fulfilled" ? results[3].value : null;
+    const factionMissions = results[4].status === "fulfilled" ? results[4].value : [];
+    const factionOrders = results[5].status === "fulfilled" ? results[5].value : [];
 
     // Facility types catalog — fetch once, cache permanently (types don't change)
     // Only fetch faction+personal types (most relevant for build queue UI)
