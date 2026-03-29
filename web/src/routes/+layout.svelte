@@ -95,12 +95,7 @@
 		const path = window.location.pathname;
 		const isAuthPage = path === "/login" || path === "/register";
 		if (!isAuthPage) {
-			if ($isAuthenticated) {
-				connect();
-			} else {
-				// Redirect to login if not authenticated
-				goto("/login");
-			}
+			connect();
 		}
 		window.addEventListener("keydown", handleKeydown);
 	});

@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun run --watch src/app.ts",
+    "dev:all": "start.bat",
     "start": "bun run src/app.ts",
     "dev:web": "cd web && bun run dev",
     "build:web": "cd web && bun run build",
